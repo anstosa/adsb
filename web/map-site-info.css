@@ -1,0 +1,48 @@
+/* reserve space below the scaled sidebar drag control */
+#site-info {
+    padding: calc(40px * var(--SCALE)) calc(8px * var(--SCALE)) calc(10px * var(--SCALE));
+    margin-bottom: calc(6px * var(--SCALE));
+    border-bottom: 1px solid var(--BGCOLOR2);
+    color: var(--TXTCOLOR2);
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+/* align with the nested statistics table's unscaled cell spacing */
+body.ui2 #ui2_sidebar_head {
+    padding-left: 6px;
+}
+
+/* avoid reserving drag-control space when ui2 hides it on mobile */
+@media screen and (max-width: 767px) {
+    body.ui2 #site-info {
+        padding-top: calc(10px * var(--SCALE));
+    }
+}
+
+/* keep the station name prominent at narrow sidebar widths */
+#site-info-title {
+    margin: 0 0 calc(8px * var(--SCALE));
+    font-size: var(--FS3);
+    line-height: 1.3;
+}
+
+/* separate receiver details from the service credit */
+#site-info p {
+    margin: calc(6px * var(--SCALE)) 0 0;
+    font-size: var(--FS2);
+    line-height: 1.5;
+}
+
+/* keep the external link identifiable in every map theme */
+#site-info a {
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+}
+
+/* preserve a visible keyboard focus indicator */
+#site-info a:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}

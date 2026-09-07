@@ -114,9 +114,9 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("READSB_LAT", environment)
         self.assertNotIn("READSB_LON", environment)
         self.assertNotIn("READSB_ALT", environment)
-        self.assertEqual(environment["TAR1090_DEFAULTCENTERLAT"], "39.5")
-        self.assertEqual(environment["TAR1090_DEFAULTCENTERLON"], "-98.35")
-        self.assertEqual(environment["TAR1090_DEFAULTZOOMLVL"], "4")
+        self.assertEqual(environment["TAR1090_DEFAULTCENTERLAT"], "47.98176459220005")
+        self.assertEqual(environment["TAR1090_DEFAULTCENTERLON"], "-122.44336120839758")
+        self.assertEqual(environment["TAR1090_DEFAULTZOOMLVL"], "9.802072478907773")
 
     # prevent WebGL's early render from queuing every inactive upstream tile source
     def test_map_defaults_avoid_upstream_tile_starvation(self):
@@ -133,7 +133,16 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("loStore['ui2_optin'] ??= 'true';", core["environment"]["TAR1090_CONFIGJS_APPEND"])
         self.assertIn("window.matchMedia('(max-width: 767px)').matches", core["environment"]["TAR1090_CONFIGJS_APPEND"])
         self.assertIn("loStore['sidebar_visible'] ??= 'false';", core["environment"]["TAR1090_CONFIGJS_APPEND"])
+        self.assertEqual(core["environment"]["TAR1090_PAGETITLE"], "Ballydídean Farm Sanctuary ADS-B")
         self.assertEqual(core["environment"]["ULTRAFEEDER_CONFIG"], "")
+
+    # keep zero radio traffic distinct from PiAware process failure
+    def test_piaware_health_tracks_process_liveness(self):
+        self.settings["networks"]["flightaware"]["enabled"] = True
+        piaware = compose_for(self.settings, self.runtime, self.present)["services"]["piaware"]
+        self.assertEqual(piaware["healthcheck"]["test"], ["CMD-SHELL", "pgrep -x piaware >/dev/null"])
+        self.assertEqual(piaware["healthcheck"]["interval"], "10s")
+        self.assertNotIn("messages", str(piaware["healthcheck"]))
 
     # require complete station coordinates before accepting enabled settings
     def test_enabled_feed_requires_location(self):

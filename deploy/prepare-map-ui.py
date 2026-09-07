@@ -16,10 +16,17 @@ from pathlib import Path, PurePosixPath
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = SCRIPT_DIR / "map-ui.json"
+BRAND_FAVICON_PATH = SCRIPT_DIR.parent / "web" / "favicon.svg"
+BRAND_FAVICON_HREF = "favicon.svg?v=goose-photo-trace"
+BRAND_TITLE = "Ballydídean Farm Sanctuary ADS-B"
+SITE_INFO_HTML_PATH = SCRIPT_DIR.parent / "web" / "map-site-info.html"
+SITE_INFO_CSS_PATH = SCRIPT_DIR.parent / "web" / "map-site-info.css"
 DOWNLOAD_IO_TIMEOUT_SECONDS = 10
 DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 120
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 INDEX_DATABASE_SOURCE = 'let databaseFolder = "https://static.airplanes.live/db";'
+INDEX_FAVICON_SOURCE = '<link rel="icon" type="image/png" href="images/tar1090-favicon.png">'
+INDEX_TITLE_SOURCE = "<title>tar1090</title>"
 BUNDLE_METADATA_FILES = frozenset({"version.json", "provenance.json"})
 
 
@@ -140,23 +147,61 @@ def install_absolute_link(path: Path, target: str) -> None:
     path.symlink_to(target)
 
 
+# validate every pinned marker before transforming source content
+def replace_exact_markers(source: str, replacements: dict[str, str], error_message: str) -> str:
+    # reject missing or ambiguous markers in the original source
+    for marker in replacements:
+        # preserve each caller's integration-specific failure message
+        if source.count(marker) != 1:
+            raise ValueError(error_message)
+    # apply only the fully validated replacement set
+    for marker, replacement in replacements.items():
+        source = source.replace(marker, replacement)
+    return source
+
+
 # rewrite only the reviewed upstream database declaration
 def wire_local_database(index_path: Path, database_directory: str) -> None:
+    index = replace_exact_markers(
+        index_path.read_text(encoding="utf-8"),
+        {INDEX_DATABASE_SOURCE: f"let databaseFolder = '{database_directory}';"},
+        "expected external database declaration was not found exactly once",
+    )
+    index_path.write_text(index, encoding="utf-8")
+
+
+# replace the upstream browser identity with sanctuary branding
+def wire_branding(index_path: Path) -> None:
     index = index_path.read_text(encoding="utf-8")
-    # fail when upstream wiring changes
-    if index.count(INDEX_DATABASE_SOURCE) != 1:
-        raise ValueError("expected external database declaration was not found exactly once")
-    replacement = f"let databaseFolder = '{database_directory}';"
-    index_path.write_text(index.replace(INDEX_DATABASE_SOURCE, replacement), encoding="utf-8")
+    replacements = {
+        INDEX_FAVICON_SOURCE: f'<link rel="icon" type="image/svg+xml" href="{BRAND_FAVICON_HREF}">',
+        INDEX_TITLE_SOURCE: f"<title>{BRAND_TITLE}</title>",
+    }
+    index = replace_exact_markers(index, replacements, "expected map branding marker was not found exactly once")
+    index_path.write_text(index, encoding="utf-8")
+
+
+# keep sanctuary information above both classic and ui2 sidebar content
+def wire_site_info(index_path: Path) -> None:
+    index = index_path.read_text(encoding="utf-8")
+    markup = SITE_INFO_HTML_PATH.read_text(encoding="utf-8")
+    styles = SITE_INFO_CSS_PATH.read_text(encoding="utf-8")
+    replacements = {
+        "</head>": f'<style id="site-info-styles">\n{styles}</style>\n  </head>',
+        '<div id="sidebar_canvas">': f'<div id="sidebar_canvas">\n{markup}',
+    }
+    index = replace_exact_markers(index, replacements, "expected site info marker was not found exactly once")
+    index_path.write_text(index, encoding="utf-8")
 
 
 # disable the public aggregator before early startup resolves API paths
 def wire_local_receiver(early_path: Path, patch: dict) -> None:
-    source = early_path.read_text(encoding="utf-8")
-    # fail when upstream startup logic changes
-    if source.count(patch["source"]) != 1:
-        raise ValueError("expected aggregator declaration was not found exactly once")
-    early_path.write_text(source.replace(patch["source"], patch["replacement"]), encoding="utf-8")
+    source = replace_exact_markers(
+        early_path.read_text(encoding="utf-8"),
+        {patch["source"]: patch["replacement"]},
+        "expected aggregator declaration was not found exactly once",
+    )
+    early_path.write_text(source, encoding="utf-8")
 
 
 # verify source assets before running the upstream cachebuster
@@ -281,6 +326,9 @@ def build_bundle(source_root: Path, archive: Path, staging_root: Path, manifest:
     html = staging_root / "bundle"
     shutil.copytree(source_root / "html", html)
     wire_local_database(html / "index.html", dependency["database_directory"])
+    wire_branding(html / "index.html")
+    wire_site_info(html / "index.html")
+    shutil.copy2(BRAND_FAVICON_PATH, html / "favicon.svg")
     local_patches = manifest["local_patches"]
     # keep the published patch record exact and bounded
     if len(local_patches) != 1 or local_patches[0]["file"] != "early.js":

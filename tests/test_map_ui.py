@@ -105,6 +105,96 @@ class MapUiPreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exactly once"):
                     preparer["wire_local_receiver"](early, MANIFEST["local_patches"][0])
 
+    # replace only the reviewed map title and favicon markup
+    def test_map_branding_replaces_upstream_title_and_favicon(self):
+        preparer = runpy.run_path(str(SCRIPT))
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "index.html"
+            index.write_text(
+                f"{preparer['INDEX_FAVICON_SOURCE']}\n{preparer['INDEX_TITLE_SOURCE']}\n",
+                encoding="utf-8",
+            )
+
+            preparer["wire_branding"](index)
+
+            branded = index.read_text(encoding="utf-8")
+            self.assertIn('<link rel="icon" type="image/svg+xml" href="favicon.svg?v=goose-photo-trace">', branded)
+            self.assertIn("<title>Ballydídean Farm Sanctuary ADS-B</title>", branded)
+            self.assertNotIn("tar1090-favicon.png", branded)
+            self.assertNotIn("<title>tar1090</title>", branded)
+
+    # preserve the input file when either branding marker is absent or ambiguous
+    def test_map_branding_rejects_missing_or_duplicate_markers(self):
+        preparer = runpy.run_path(str(SCRIPT))
+        markers = (preparer["INDEX_FAVICON_SOURCE"], preparer["INDEX_TITLE_SOURCE"])
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "index.html"
+            # cover each independently required browser metadata marker
+            for marker in markers:
+                # reject both missing and repeated source markup
+                for count in (0, 2):
+                    source = "\n".join(markers).replace(marker, marker * count)
+                    index.write_text(source, encoding="utf-8")
+                    with self.subTest(marker=marker, count=count):
+                        with self.assertRaisesRegex(ValueError, "branding marker.*exactly once"):
+                            preparer["wire_branding"](index)
+                        self.assertEqual(source, index.read_text(encoding="utf-8"))
+
+    # reject unexpected database wiring without changing the original document
+    def test_local_database_rejects_missing_or_duplicate_markers(self):
+        preparer = runpy.run_path(str(SCRIPT))
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "index.html"
+            # exercise absent and ambiguous database declarations
+            for count in (0, 2):
+                source = preparer["INDEX_DATABASE_SOURCE"] * count
+                index.write_text(source, encoding="utf-8")
+                with self.subTest(count=count):
+                    with self.assertRaisesRegex(ValueError, "database declaration.*exactly once"):
+                        preparer["wire_local_database"](index, "local-db")
+                    self.assertEqual(source, index.read_text(encoding="utf-8"))
+
+    # place site details above the upstream aircraft sidebar content
+    def test_site_info_is_scoped_to_the_top_of_the_sidebar(self):
+        preparer = runpy.run_path(str(SCRIPT))
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "index.html"
+            index.write_text(
+                '<head></head><body><div id="sidebar_canvas"><div id="sidebar-table"></div></div></body>',
+                encoding="utf-8",
+            )
+
+            preparer["wire_site_info"](index)
+
+            branded = index.read_text(encoding="utf-8")
+            self.assertEqual(1, branded.count('id="site-info"'))
+            self.assertLess(branded.index('<style id="site-info-styles">'), branded.index("</head>"))
+            self.assertLess(branded.index('id="sidebar_canvas"'), branded.index('id="site-info"'))
+            self.assertLess(branded.index('id="site-info"'), branded.index('id="sidebar-table"'))
+            self.assertIn((ROOT / "web/map-site-info.html").read_text(encoding="utf-8"), branded)
+            self.assertIn((ROOT / "web/map-site-info.css").read_text(encoding="utf-8"), branded)
+            self.assertIn('<h1 id="site-info-title">Ballydídean Farm Sanctuary ADS-B</h1>', branded)
+            self.assertIn("Airspy Mini (1090Mhz) and ADSBx Orange (978Mhz)", branded)
+            self.assertIn("operating in the Maxwelton Valley on South Whidbey.", branded)
+            self.assertIn('href="https://ballydidean.farm" target="_blank" rel="noopener noreferrer"', branded)
+
+    # fail atomically when the pinned insertion points change
+    def test_site_info_rejects_missing_or_duplicate_anchors(self):
+        preparer = runpy.run_path(str(SCRIPT))
+        anchors = ("</head>", '<div id="sidebar_canvas">')
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "index.html"
+            # exercise each absent and ambiguous insertion point
+            for anchor in anchors:
+                # cover missing markers and multiple matches
+                for count in (0, 2):
+                    source = "\n".join(anchors).replace(anchor, anchor * count)
+                    index.write_text(source, encoding="utf-8")
+                    with self.subTest(anchor=anchor, count=count):
+                        with self.assertRaisesRegex(ValueError, "exactly once"):
+                            preparer["wire_site_info"](index)
+                        self.assertEqual(source, index.read_text(encoding="utf-8"))
+
     # reject an archive before extraction or output publication
     def test_rejects_archive_with_wrong_checksum(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -156,6 +246,14 @@ class MapUiPreparationTests(unittest.TestCase):
             index = (output / "index.html").read_text(encoding="utf-8")
             self.assertNotIn("https://static.airplanes.live/db", index)
             self.assertIn("let databaseFolder = 'db-3.14.1715';", index)
+            self.assertIn('<link rel="icon" type="image/svg+xml" href="favicon.svg?v=goose-photo-trace">', index)
+            self.assertIn("<title>Ballydídean Farm Sanctuary ADS-B</title>", index)
+            self.assertEqual((ROOT / "web/favicon.svg").read_bytes(), (output / "favicon.svg").read_bytes())
+            self.assertIn((ROOT / "web/map-site-info.html").read_text(encoding="utf-8"), index)
+            self.assertIn((ROOT / "web/map-site-info.css").read_text(encoding="utf-8"), index)
+            self.assertEqual(1, index.count('id="site-info"'))
+            self.assertLess(index.index('id="sidebar_canvas"'), index.index('id="site-info"'))
+            self.assertLess(index.index('id="site-info"'), index.index('id="sidebar-table"'))
 
             early_reference = re.search(r"early_[0-9a-f]{32}\.js", index)
             self.assertIsNotNone(early_reference)

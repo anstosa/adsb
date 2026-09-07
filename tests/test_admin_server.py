@@ -32,6 +32,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # lock provider-owned frontend identity behavior
 class AdminFrontendContractTest(unittest.TestCase):
+    # lock sanctuary title and favicon branding
+    def test_sanctuary_title_and_favicon(self) -> None:
+        html = (PROJECT_ROOT / "web/admin.html").read_text(encoding="utf-8")
+        favicon = (PROJECT_ROOT / "web/favicon.svg").read_text(encoding="utf-8")
+        self.assertIn("<title>Ballydídean Farm Sanctuary ADS-B</title>", html)
+        self.assertIn('<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=goose-photo-trace">', html)
+        self.assertIn("#C8B744", favicon)
+        self.assertIn("#7C5174", favicon)
+        self.assertIn("traced silhouette of a goose in flight pointing upper right", favicon)
+        self.assertIn('<path fill="#C8B744"', favicon)
+        self.assertNotIn('fill="none"', favicon)
+
     # keep FlightAware outside the local UUID workflow
     def test_flightaware_uses_provider_issued_identity(self) -> None:
         html = (PROJECT_ROOT / "web/admin.html").read_text(encoding="utf-8")
@@ -53,6 +65,7 @@ class AdminServerTest(unittest.TestCase):
         self.web_root.mkdir()
         (self.web_root / "admin.html").write_text("<!doctype html><title>Admin</title>", encoding="utf-8")
         (self.web_root / "admin.js").write_text("console.log('admin')", encoding="utf-8")
+        (self.web_root / "favicon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
         self.settings_path = self.root / "config" / "settings.json"
         self.status_path = self.root / "status" / "status.json"
         self.password = secrets.token_urlsafe(24)
@@ -198,6 +211,10 @@ class AdminServerTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn(b"Admin", content)
         self.assertEqual("no-store", headers["cache-control"])
+        status, headers, content = self.request("GET", "/favicon.svg")
+        self.assertEqual(200, status)
+        self.assertEqual("image/svg+xml", headers["content-type"])
+        self.assertIn(b"<svg", content)
 
     # verify traversal and escaping symlinks are blocked
     def test_static_traversal_is_rejected(self) -> None:

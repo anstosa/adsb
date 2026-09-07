@@ -30,9 +30,38 @@ Fill the station name, actual antenna latitude/longitude, and elevation in metre
 
 `enabled` is the saved request; `applied_revision` identifies settings processed by the controller. A running uploader is not the same as a TCP connection, and neither proves acceptance by the upstream provider. Receiver USB presence does not prove successful RF reception. Missing connector telemetry remains unknown rather than being reported as a remote disconnection. Requested containers that stop or become unhealthy put the controller into an error phase and are force-recreated within the fixed Compose project. Without hardware, the expected state is an empty map and **awaiting radios**.
 
-Until antenna coordinates are saved, the map shows a display-only U.S. overview; this is not a receiver position. The pinned tar1090 build has an upstream storage-proxy bug at an exactly zero map-center coordinate, so its initial view deliberately avoids zero. Optional terrain-outline data is not configured during hardware-free staging.
+PiAware container health tracks the local PiAware process rather than recent message volume. Provider connectivity and received radio traffic remain separate runtime observations, so a quiet receiver does not make a functioning uploader process unhealthy.
+
+New browsers center on the configured receiver site at zoom `9.802072478907773`, which displays a **5 mi** scale at the current site's latitude. This is the map's scale bar, not a five-mile radius or aircraft-distance filter. Until a site is configured, the previous display-only center (`47.98176459220005`, `-122.44336120839758`) remains the fallback; it is never sent to the decoder as an antenna position. Optional terrain-outline data is not configured during hardware-free staging.
 
 New browsers default to canvas aircraft icons because this tar1090 build's initial WebGL render can queue inactive chart layers and starve the selected basemap. Explicit browser preferences are preserved; if an existing WebGL-enabled browser shows a blank map, open `/map/?nowebgl=1` to select the working renderer.
+
+### Map defaults
+
+`adsb_admin/map_defaults.py` contains the reviewed first-visit defaults: OpenStreetMap, imperial units, label detail level 1, weather and airspace overlays, selected table columns, descending altitude sorting, and a 434-pixel desktop sidebar. Only aircraft on screen are listed, ground vehicles are hidden, and faded aircraft are not kept visible. Narrow screens retain the hidden-sidebar default. Saved browser values take precedence over these defaults; explicit URL view overrides still work. A fresh browser centers on the actual receiver site without overwriting a previously saved map center or changing antenna configuration.
+
+Tracks for all aircraft start enabled through tar1090's existing `allTracks` startup option, without changing the browser URL. This upstream toggle is session-only, not a saved browser preference: **Tools → Show tracks for all aircraft** can turn it off for the current session, and a reload starts with tracks enabled again.
+
+The controller appends these settings to the generated `config.js` through `TAR1090_CONFIGJS_APPEND`. The zoom key uses tar1090's current-origin/current-path storage proxy; center keys are left to tar1090's saved-view/site-position behavior. Recent searches, bookmarks, `LK_*` values, and `webglTested` are not imported. New visitors use the safe canvas renderer rather than WebGL.
+
+To inspect another browser's preferences, arrange `/map/` in that browser and run this read-only snippet in its developer console (select the map's frame when embedded). In Chromium DevTools, `copy` places the JSON on the clipboard. Review saved locations and other site-local storage before sharing the result.
+
+```javascript
+// copy the current view and saved browser preferences
+copy(JSON.stringify({
+  url: location.href,
+  view: {
+    centerLonLat: getCenter(),
+    zoom: getZoom(),
+    rotationRadians: OLMap.getView().getRotation(),
+    basemap: MapType_tar1090,
+    units: DisplayUnits
+  },
+  savedPreferences: { ...localStorage }
+}, null, 2));
+```
+
+Changes require the normal application deployment; do not edit generated map assets or runtime Compose files. Verify new defaults in a fresh private browser window, without clearing an existing user's preferences.
 
 ### Experimental map UI
 

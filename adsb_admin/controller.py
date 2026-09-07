@@ -15,6 +15,8 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import UUID
 
+from adsb_admin.map_defaults import VIEW_DEFAULTS, config_js
+
 NETWORKS = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
 DESTINATIONS = {
     "adsbexchange": ("feed1.adsbexchange.com", "feed.adsbexchange.com", 39008),
@@ -145,22 +147,14 @@ def compose_for(settings, runtime, hardware):
         "UPDATE_TAR1090": "false",
         # serve the reviewed static ui while retaining local decoder routes
         "CUSTOM_HTML": "true",
-        # show a display-only US overview without inventing antenna coordinates
-        "TAR1090_DEFAULTCENTERLAT": "39.5",
-        "TAR1090_DEFAULTCENTERLON": "-98.35",
-        "TAR1090_DEFAULTZOOMLVL": "4",
-        "TAR1090_PAGETITLE": "Ballydidean Farm ADS-B",
+        # use the display-only fallback until actual site coordinates are known
+        "TAR1090_DEFAULTCENTERLAT": VIEW_DEFAULTS["CenterLat"],
+        "TAR1090_DEFAULTCENTERLON": VIEW_DEFAULTS["CenterLon"],
+        "TAR1090_DEFAULTZOOMLVL": VIEW_DEFAULTS["zoomLvl"],
+        "TAR1090_PAGETITLE": "Ballydídean Farm Sanctuary ADS-B",
         "TAR1090_MAPTYPE_TAR1090": "osm",
-        # avoid upstream startup tile starvation while preserving explicit browser choices
-        "TAR1090_CONFIGJS_APPEND": (
-            "// default to canvas icons before the initial map render\nloStore['webgl'] ??= 'false';\n"
-            "// prefer the experimental ui without overriding a saved classic choice\n"
-            "loStore['ui2_optin'] ??= 'true';\n"
-            "// keep the map visible on narrow screens unless a sidebar choice is saved\n"
-            "if (window.matchMedia('(max-width: 767px)').matches) {\n"
-            "    loStore['sidebar_visible'] ??= 'false';\n"
-            "}"
-        ),
+        # seed reviewed first-visit preferences without replacing browser choices
+        "TAR1090_CONFIGJS_APPEND": config_js(),
         "MLAT_USER": station["name"].replace(" ", "_"),
         "LOGLEVEL": "error",
     }
@@ -172,7 +166,6 @@ def compose_for(settings, runtime, hardware):
                 "READSB_LON": str(station["longitude"]),
                 "TAR1090_DEFAULTCENTERLAT": str(station["latitude"]),
                 "TAR1090_DEFAULTCENTERLON": str(station["longitude"]),
-                "TAR1090_DEFAULTZOOMLVL": "9",
             }
         )
     # send elevation only after it is configured
@@ -282,6 +275,14 @@ def compose_for(settings, runtime, hardware):
             {
                 "environment": piaware_env,
                 "depends_on": ["ultrafeeder"],
+                # keep absent radio traffic out of process health
+                "healthcheck": {
+                    "test": ["CMD-SHELL", "pgrep -x piaware >/dev/null"],
+                    "interval": "10s",
+                    "timeout": "5s",
+                    "retries": 3,
+                    "start_period": "20s",
+                },
                 "volumes": [f"{data_dir}/piaware:/var/cache/piaware"],
                 "tmpfs": ["/run:exec,size=64m", "/tmp:size=32m"],
             }
