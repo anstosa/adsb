@@ -1,0 +1,24 @@
+[Unit]
+Description=ADS-B receiver configuration reconciler
+After=docker.service adsb-admin.service
+Requires=docker.service
+Wants=adsb-admin.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/adsb/current
+ExecStart=/usr/bin/python3 -m adsb_admin.controller
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/adsb/runtime /var/lib/adsb/status
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

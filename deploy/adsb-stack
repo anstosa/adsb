@@ -1,0 +1,28 @@
+#!/bin/sh
+# launch only fixed production stack operations in an isolated interpreter
+set -eu
+
+# require exactly one allowlisted operation
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' 'expected exactly one of: status, start, stop, restart' >&2
+    exit 64
+fi
+
+# reject arbitrary commands and arguments before entering Python
+case "$1" in
+    status|start|stop|restart) ;;
+    *)
+        printf '%s\n' 'expected exactly one of: status, start, stop, restart' >&2
+        exit 64
+        ;;
+esac
+
+# refuse nonroot use before Python can reach systemd or Docker
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+    printf '%s\n' 'root execution required' >&2
+    exit 77
+fi
+
+cd /
+exec /usr/bin/env -i HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/bin/python3 -I /opt/adsb/current/adsb_admin/stack.py "$1"

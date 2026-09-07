@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "airplanes-live-tar1090-experimental",
+  "tar1090Version": "3.14.1817-airplanes-live-0c4e109",
+  "databaseVersion": "3.14.1715",
+  "upstream": {
+    "repository": "https://github.com/airplanes-live/tar1090",
+    "commit": "0c4e109369620ac679ccc98ca3f090e0e41a3339",
+    "version": "3.14.1817",
+    "archive_url": "https://codeload.github.com/airplanes-live/tar1090/tar.gz/0c4e109369620ac679ccc98ca3f090e0e41a3339",
+    "archive_sha256": "35450c211b423a2e05f5451f69df59dd461899cbc2095b2593c89d2b7da90140",
+    "archive_size_bytes": 2829513,
+    "archive_filename": "airplanes-live-tar1090-0c4e109369620ac679ccc98ca3f090e0e41a3339.tar.gz",
+    "source_root": "tar1090-0c4e109369620ac679ccc98ca3f090e0e41a3339",
+    "license": "GPL-2.0-or-later"
+  },
+  "assets": {
+    "ui2.js": {
+      "sha256": "c0618dbdf8ebf1e25209be5bfa41d9df39176b924d77e113b085053245b3f8d6",
+      "md5": "0314cfce60f66e9ae93b7a0baed72250"
+    },
+    "ui2.css": {
+      "sha256": "8b7b74b0fcee99b490526e4f69a4c081c91b69084049139ecca262f1521f01a8",
+      "md5": "15b83787f79f373a3a0b4a693704c7ad"
+    }
+  },
+  "cachebust": {
+    "script_sha256": "eea2c14191ec4a32dd4d3548148e7455de3ac55f2ab3018f416b884a62454f99",
+    "list_sha256": "71a9714220b443457a1a0dacae12d5916adcc5e7ab9ad29f9b80d5a38931d9f0"
+  },
+  "local_patches": [
+    {
+      "file": "early.js",
+      "reason": "use local receiver metadata rather than the public aggregator API",
+      "source": "let aggregator = true;",
+      "replacement": "// use local receiver metadata rather than the public aggregator\nlet aggregator = false;"
+    }
+  ],
+  "base_image_dependency": {
+    "image_role": "ultrafeeder",
+    "html_root": "/usr/local/share/tar1090/html-webroot",
+    "database_directory": "db-3.14.1715",
+    "config": "config.js",
+    "optional_upintheair": "upintheair.json"
+  }
+}

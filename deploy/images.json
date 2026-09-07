@@ -1,0 +1,8 @@
+{
+  "ultrafeeder": "ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder@sha256:fbf81742db245886ceb9c782fb6a707bc6c90b6822d91a1a094b370722e27484",
+  "piaware": "ghcr.io/sdr-enthusiasts/docker-piaware@sha256:086f48dfbb31d7551e40c0d3d57a6b4727eb54aa184e5c438ca57151740e299c",
+  "airspy": "ghcr.io/sdr-enthusiasts/airspy_adsb@sha256:57d535c6f7e23eb7342f15a282979680aa0a4022d8d49bcea0b787e9ba683991",
+  "dump978": "ghcr.io/sdr-enthusiasts/docker-dump978@sha256:84959fa5e7476d210c533b578954cd8e49db5d3944602eef8e40f80ee8af44b2",
+  "proxy": "nginx@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c",
+  "cloudflared": "cloudflare/cloudflared@sha256:51c9cefcb4569df44e1ad403ab1d3d8065aa8e84339bcfc6aee75502e1140339"
+}

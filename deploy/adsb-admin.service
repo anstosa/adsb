@@ -1,0 +1,25 @@
+[Unit]
+Description=ADS-B authenticated station administration
+After=network.target
+
+[Service]
+Type=simple
+User=adsb
+Group=adsb
+WorkingDirectory=/opt/adsb/current
+EnvironmentFile=/etc/adsb/admin.env
+ExecStart=/usr/bin/python3 -m adsb_admin
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/adsb/config
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

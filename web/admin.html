@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Administration for the Ballydidean Farm ADS-B receiver station">
+    <title>Station Admin | Ballydidean Farm ADS-B</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/admin.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+
+    <header class="site-header">
+      <a class="brand" href="/map/" aria-label="Ballydidean Farm ADS-B map">
+        <span class="brand-mark" aria-hidden="true">AD</span>
+        <span>
+          <strong>Ballydidean Farm</strong>
+          <small>ADS-B receiver station</small>
+        </span>
+      </a>
+      <nav class="header-actions" aria-label="Site navigation">
+        <a class="button button-quiet" href="/map/">View aircraft map</a>
+        <button class="button button-quiet" id="logout-button" type="button" hidden>Log out</button>
+      </nav>
+    </header>
+
+    <main id="main-content">
+      <section class="login-shell" id="login-view" hidden>
+        <div class="login-panel panel">
+          <div class="eyebrow">Restricted access</div>
+          <h1>Station administration</h1>
+          <p class="lede">Sign in to manage receiver identity and outbound feed services.</p>
+
+          <form id="login-form" novalidate>
+            <div class="field">
+              <label for="password">Admin password</label>
+              <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+            </div>
+            <p class="form-error" id="login-error" role="alert" hidden></p>
+            <button class="button button-primary button-full" id="login-button" type="submit">Sign in</button>
+          </form>
+
+          <p class="security-note">This page changes services on the receiver host. Credentials are sent only to this site.</p>
+        </div>
+      </section>
+
+      <section class="dashboard" id="admin-view" hidden>
+        <div class="page-heading">
+          <div>
+            <div class="eyebrow">Production receiver</div>
+            <h1>Station control</h1>
+            <p class="lede">Configure the station and choose where genuine local radio traffic is shared.</p>
+          </div>
+          <div class="phase-badge phase-waiting" id="phase-badge">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="phase-label">Awaiting radios</span>
+          </div>
+        </div>
+
+        <section class="readiness-banner" aria-labelledby="readiness-title">
+          <div class="readiness-icon" aria-hidden="true">RX</div>
+          <div>
+            <h2 id="readiness-title">Awaiting local radio reception</h2>
+            <p id="readiness-message">The software can be configured now. Aircraft appear only when attached radios receive real traffic; no live reception has been verified.</p>
+          </div>
+        </section>
+
+        <form id="settings-form" novalidate>
+          <section class="panel station-panel" aria-labelledby="station-heading">
+            <div class="section-heading">
+              <div>
+                <div class="eyebrow">Receiver identity</div>
+                <h2 id="station-heading">Station details</h2>
+              </div>
+              <span class="revision-label" id="revision-label">Revision —</span>
+            </div>
+
+            <div class="station-fields">
+              <div class="field field-wide">
+                <label for="station-name">Station name</label>
+                <input id="station-name" name="station_name" type="text" required minlength="1" maxlength="64" pattern="[A-Za-z0-9 ._\-]{1,64}" placeholder="Ballydidean Farm" aria-describedby="station-name-help station-name-error">
+                <small id="station-name-help">1–64 letters, numbers, spaces, periods, underscores or hyphens</small>
+                <small class="input-error" id="station-name-error" hidden></small>
+              </div>
+              <div class="field">
+                <label for="station-latitude">Latitude</label>
+                <input id="station-latitude" name="station_latitude" type="number" min="-90" max="90" step="any" inputmode="decimal" placeholder="48.123456" aria-describedby="station-latitude-help station-latitude-error">
+                <small id="station-latitude-help">Decimal degrees, −90 to 90</small>
+                <small class="input-error" id="station-latitude-error" hidden></small>
+              </div>
+              <div class="field">
+                <label for="station-longitude">Longitude</label>
+                <input id="station-longitude" name="station_longitude" type="number" min="-180" max="180" step="any" inputmode="decimal" placeholder="-122.123456" aria-describedby="station-longitude-help station-longitude-error">
+                <small id="station-longitude-help">Decimal degrees, −180 to 180</small>
+                <small class="input-error" id="station-longitude-error" hidden></small>
+              </div>
+              <div class="field">
+                <label for="station-altitude">Elevation</label>
+                <div class="input-suffix">
+                  <input id="station-altitude" name="station_altitude" type="number" min="-500" max="10000" step="any" inputmode="decimal" placeholder="120" aria-describedby="station-altitude-help station-altitude-error">
+                  <span>metres</span>
+                </div>
+                <small id="station-altitude-help">Receiver antenna elevation</small>
+                <small class="input-error" id="station-altitude-error" hidden></small>
+              </div>
+            </div>
+          </section>
+
+          <section aria-labelledby="feeds-heading">
+            <div class="section-heading feeds-heading">
+              <div>
+                <div class="eyebrow">Outbound sharing</div>
+                <h2 id="feeds-heading">Feed networks</h2>
+                <p>Every feed starts off. Enable one only after its account or feeder credentials are ready.</p>
+              </div>
+            </div>
+
+            <div class="network-grid">
+              <article class="network-card panel" data-network="adsbexchange">
+                <div class="network-card-header">
+                  <div>
+                    <h3>ADS-B Exchange</h3>
+                    <a href="https://www.adsbexchange.com/already-feeding/" target="_blank" rel="noopener noreferrer">Setup documentation <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <label class="switch-control">
+                    <span class="switch-label">Feed enabled</span>
+                    <input id="adsbexchange-enabled" type="checkbox" role="switch">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="network-state-row">
+                  <span class="state-chip state-off" id="adsbexchange-requested">Requested: off</span>
+                  <span class="runtime-state" id="adsbexchange-runtime">Controller status unavailable</span>
+                </div>
+                <div class="network-options">
+                  <label class="switch-control switch-control-compact">
+                    <span class="switch-label">MLAT</span>
+                    <input id="adsbexchange-mlat" type="checkbox" role="switch" disabled>
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                  <div class="field feeder-field">
+                    <label for="adsbexchange-feeder-id">Feeder ID</label>
+                    <div class="feeder-input-row">
+                      <input id="adsbexchange-feeder-id" type="text" autocomplete="off" spellcheck="false" placeholder="Enter a new feeder ID" aria-describedby="adsbexchange-feeder-hint">
+                      <button class="button button-quiet generate-feeder" id="adsbexchange-generate" type="button">Generate ID</button>
+                    </div>
+                    <small id="adsbexchange-feeder-hint">No feeder ID is configured</small>
+                    <small>A generated UUID is local only; it does not register a network account.</small>
+                    <button class="text-button clear-feeder" id="adsbexchange-clear" type="button" hidden>Clear saved feeder ID</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="network-card panel" data-network="flightaware">
+                <div class="network-card-header">
+                  <div>
+                    <h3>FlightAware</h3>
+                    <a href="https://github.com/sdr-enthusiasts/docker-piaware#determining-your-feeder-id" target="_blank" rel="noopener noreferrer">Container setup documentation <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <label class="switch-control">
+                    <span class="switch-label">Feed enabled</span>
+                    <input id="flightaware-enabled" type="checkbox" role="switch">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="network-state-row">
+                  <span class="state-chip state-off" id="flightaware-requested">Requested: off</span>
+                  <span class="runtime-state" id="flightaware-runtime">Controller status unavailable</span>
+                </div>
+                <div class="network-options">
+                  <label class="switch-control switch-control-compact">
+                    <span class="switch-label">MLAT</span>
+                    <input id="flightaware-mlat" type="checkbox" role="switch" disabled>
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                  <div class="field feeder-field">
+                    <label for="flightaware-feeder-id">Feeder ID</label>
+                    <div class="feeder-input-row">
+                      <input id="flightaware-feeder-id" type="text" autocomplete="off" spellcheck="false" placeholder="Leave blank for a new station" aria-describedby="flightaware-feeder-hint">
+                    </div>
+                    <small id="flightaware-feeder-hint">No feeder ID is configured</small>
+                    <small>FlightAware assigns new IDs after the feed starts. Enter an existing ID only to preserve a previously registered site.</small>
+                    <a id="flightaware-claim" href="https://www.flightaware.com/adsb/piaware/claim" target="_blank" rel="noopener noreferrer" hidden>Claim or view this FlightAware receiver <span aria-hidden="true">↗</span></a>
+                    <button class="text-button clear-feeder" id="flightaware-clear" type="button" hidden>Clear saved feeder ID</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="network-card panel" data-network="adsblol">
+                <div class="network-card-header">
+                  <div>
+                    <h3>ADSB.lol</h3>
+                    <a href="https://www.adsb.lol/docs/feeders-only/introduction/" target="_blank" rel="noopener noreferrer">Setup documentation <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <label class="switch-control">
+                    <span class="switch-label">Feed enabled</span>
+                    <input id="adsblol-enabled" type="checkbox" role="switch">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="network-state-row">
+                  <span class="state-chip state-off" id="adsblol-requested">Requested: off</span>
+                  <span class="runtime-state" id="adsblol-runtime">Controller status unavailable</span>
+                </div>
+                <div class="network-options">
+                  <label class="switch-control switch-control-compact">
+                    <span class="switch-label">MLAT</span>
+                    <input id="adsblol-mlat" type="checkbox" role="switch" disabled>
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                  <div class="field feeder-field">
+                    <label for="adsblol-feeder-id">Feeder ID</label>
+                    <div class="feeder-input-row">
+                      <input id="adsblol-feeder-id" type="text" autocomplete="off" spellcheck="false" placeholder="Enter a new feeder ID" aria-describedby="adsblol-feeder-hint">
+                      <button class="button button-quiet generate-feeder" id="adsblol-generate" type="button">Generate ID</button>
+                    </div>
+                    <small id="adsblol-feeder-hint">No feeder ID is configured</small>
+                    <small>A generated UUID is local only; it does not register a network account.</small>
+                    <button class="text-button clear-feeder" id="adsblol-clear" type="button" hidden>Clear saved feeder ID</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="network-card panel" data-network="airplaneslive">
+                <div class="network-card-header">
+                  <div>
+                    <h3>Airplanes.live</h3>
+                    <a href="https://airplanes.live/how-to-feed/" target="_blank" rel="noopener noreferrer">Setup documentation <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <label class="switch-control">
+                    <span class="switch-label">Feed enabled</span>
+                    <input id="airplaneslive-enabled" type="checkbox" role="switch">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="network-state-row">
+                  <span class="state-chip state-off" id="airplaneslive-requested">Requested: off</span>
+                  <span class="runtime-state" id="airplaneslive-runtime">Controller status unavailable</span>
+                </div>
+                <div class="network-options">
+                  <label class="switch-control switch-control-compact">
+                    <span class="switch-label">MLAT</span>
+                    <input id="airplaneslive-mlat" type="checkbox" role="switch" disabled>
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                  <div class="field feeder-field">
+                    <label for="airplaneslive-feeder-id">Feeder ID</label>
+                    <div class="feeder-input-row">
+                      <input id="airplaneslive-feeder-id" type="text" autocomplete="off" spellcheck="false" placeholder="Enter a new feeder ID" aria-describedby="airplaneslive-feeder-hint">
+                      <button class="button button-quiet generate-feeder" id="airplaneslive-generate" type="button">Generate ID</button>
+                    </div>
+                    <small id="airplaneslive-feeder-hint">No feeder ID is configured</small>
+                    <small>A generated UUID is local only; it does not register a network account.</small>
+                    <button class="text-button clear-feeder" id="airplaneslive-clear" type="button" hidden>Clear saved feeder ID</button>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="controller-panel panel" aria-labelledby="controller-heading">
+            <div>
+              <div class="eyebrow">Controller</div>
+              <h2 id="controller-heading">Application status</h2>
+            </div>
+            <dl class="controller-details">
+              <div>
+                <dt>Applied revision</dt>
+                <dd id="applied-revision">—</dd>
+              </div>
+              <div>
+                <dt>Last update</dt>
+                <dd id="last-update">—</dd>
+              </div>
+              <div>
+                <dt>Hardware</dt>
+                <dd id="hardware-status">No radio telemetry reported</dd>
+              </div>
+            </dl>
+          </section>
+
+          <div class="save-bar">
+            <div class="save-message" id="save-message" role="status" aria-live="polite"></div>
+            <button class="button button-primary" id="save-button" type="submit">Save settings</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="loading-view" id="loading-view" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <p>Checking admin session…</p>
+      </section>
+    </main>
+
+    <footer>
+      <span>Private receiver administration</span>
+      <a href="/map/">Return to aircraft map</a>
+    </footer>
+  </body>
+</html>
