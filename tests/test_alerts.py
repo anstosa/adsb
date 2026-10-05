@@ -6,6 +6,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -247,6 +248,67 @@ class AlertEngineTest(unittest.TestCase):
         self.assertEqual([], self.store.history()["events"])
         self.engine.process_samples([self.sample(2, messages=2, fresh=True)], self.settings, 1_002.0, 2.0)
         self.assertEqual(1, len(self.store.history()["events"]))
+
+
+# verify aircraft push links without contacting notification providers
+class AlertDispatchTest(unittest.TestCase):
+    # carry the triggering identity through the encoded provider request
+    def test_aircraft_push_includes_selected_aircraft_map_link(self) -> None:
+        # normalize casing without confusing distinct triggering aircraft
+        for hex_id, url_hex in (("A2CCA7", "a2cca7"), ("a2CcA7", "a2cca7"), ("AE1234", "ae1234")):
+            with self.subTest(hex_id=hex_id):
+                job = {
+                    "kind": "aircraft",
+                    "channel": "pushover",
+                    "hex": hex_id,
+                    "label": "News helicopter",
+                    "categories": ["news"],
+                    "bands": ["1090"],
+                    "receptions": {"1090": "direct"},
+                }
+                settings = {"pushover": {"app_token": "fixture-app", "user_key": "fixture-user"}}
+                with mock.patch(
+                    "adsb_admin.alert_delivery._pushover_request", return_value=(200, {}, b'{"status":1}')
+                ) as request:
+                    result = dispatch_delivery(job, settings)
+                self.assertEqual("accepted", result.state)
+                request.assert_called_once()
+                form = urllib.parse.parse_qs(request.call_args.args[0].decode("utf-8"))
+                self.assertEqual([f"https://adsb.ballydidean.farm/map/?icao={url_hex}"], form["url"])
+                self.assertEqual(["Open aircraft map"], form["url_title"])
+                self.assertEqual(["0"], form["priority"])
+                self.assertIn(hex_id, form["message"][0])
+
+    # omit aircraft links for tests and untrusted identities
+    def test_push_links_require_a_genuine_aircraft_with_an_exact_icao(self) -> None:
+        # reject missing anonymous and query-injecting identities without changing delivery
+        for kind, hex_id in (
+            ("test", None),
+            ("test", "A2CCA7"),
+            ("aircraft", None),
+            ("aircraft", "~A2CCA7"),
+            ("aircraft", "A2CCA7&icao=abcdef"),
+        ):
+            with self.subTest(kind=kind, hex_id=hex_id):
+                job = {
+                    "kind": kind,
+                    "channel": "pushover",
+                    "hex": hex_id,
+                    "label": "Fixture",
+                    "categories": ["news"],
+                    "bands": ["1090"],
+                    "receptions": {"1090": "direct"},
+                }
+                settings = {"pushover": {"app_token": "fixture-app", "user_key": "fixture-user"}}
+                with mock.patch(
+                    "adsb_admin.alert_delivery._pushover_request", return_value=(200, {}, b'{"status":1}')
+                ) as request:
+                    result = dispatch_delivery(job, settings)
+                self.assertEqual("accepted", result.state)
+                request.assert_called_once()
+                form = urllib.parse.parse_qs(request.call_args.args[0].decode("utf-8"))
+                self.assertNotIn("url", form)
+                self.assertNotIn("url_title", form)
 
 
 # verify independent maintenance scheduling without providers or physical traffic

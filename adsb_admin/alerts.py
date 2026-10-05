@@ -140,7 +140,10 @@ def dispatch_delivery(job: dict[str, Any], settings: dict[str, Any]) -> Delivery
         return DeliveryResult("failed", "unsupported_channel")
     # select only the fixed configured provider
     if job["channel"] == "pushover":
-        return send_pushover(settings["pushover"], title=title, message=body)
+        # link only genuine aircraft with a validated identity
+        hex_id = normalize_icao(job.get("hex")) if job["kind"] == "aircraft" else None
+        url = f"https://adsb.ballydidean.farm/map/?icao={hex_id.lower()}" if hex_id else None
+        return send_pushover(settings["pushover"], title=title, message=body, url=url)
     # send the independent email channel
     if job["channel"] == "email":
         return send_email(
