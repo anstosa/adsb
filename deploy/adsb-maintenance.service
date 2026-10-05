@@ -1,0 +1,23 @@
+[Unit]
+Description=ADS-B release retention and pinned application update review
+After=network-online.target apt-daily-upgrade.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=DOCKER_CONFIG=/run/adsb-maintenance/docker
+RuntimeDirectory=adsb-maintenance
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I -B /opt/adsb/current/adsb_admin/maintenance.py
+TimeoutStartSec=20min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/adsb/releases /opt/adsb/map-ui-releases /var/lib/adsb/runtime /var/lib/adsb/status
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0027
+MemoryMax=192M

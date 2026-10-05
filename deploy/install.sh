@@ -19,7 +19,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install --no-install-recommends -y docker.io docker-compose-v2 python3 ca-certificates curl
+apt-get install --no-install-recommends -y docker.io docker-compose-v2 python3 ca-certificates curl unattended-upgrades age
 systemctl enable --now docker
 
 # use a dedicated unprivileged web account without Docker group membership
@@ -30,9 +30,12 @@ fi
 usermod -G '' adsb
 install -d -m 755 /opt/adsb /opt/adsb/releases /etc/adsb /var/lib/adsb
 install -d -o adsb -g adsb -m 700 /var/lib/adsb/config
+install -d -o adsb -g adsb -m 700 /var/lib/adsb/alerts
+install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source
+install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source/1090 /var/lib/adsb/alert-source/978
 install -d -o root -g adsb -m 2750 /var/lib/adsb/status
 install -d -m 700 /var/lib/adsb/runtime /var/lib/adsb/cloudflared
-install -d -m 755 /var/lib/adsb/tar1090
+install -d -m 755 /var/lib/adsb/tar1090 /var/lib/adsb/collectd
 install -d -m 700 /var/lib/adsb/piaware
 # restrict status created by an earlier release
 if [[ -e /var/lib/adsb/status/status.json ]]; then
@@ -48,6 +51,7 @@ MAP_RELEASE="/opt/adsb/map-ui-releases/$RELEASE_ID"
 ROLLBACK_DIR="/var/lib/adsb/runtime/activation-$RELEASE_ID"
 ACTIVATION_STARTED=false
 ACTIVATION_COMPLETE=false
+APPLICATION_READY=false
 CURRENT_CODE=""
 PREVIOUS_MAP=""
 LEGACY_LAYOUT=false
@@ -60,8 +64,12 @@ source "$SOURCE_DIR/deploy/release-transaction.sh"
 # retain prior service activation state for rollback
 ADMIN_WAS_ENABLED=false
 CONTROLLER_WAS_ENABLED=false
+ALERTS_WAS_ENABLED=false
 ADMIN_WAS_ACTIVE=false
 CONTROLLER_WAS_ACTIVE=false
+ALERTS_WAS_ACTIVE=false
+TIMER_UNITS=(adsb-maintenance.timer apt-daily.timer apt-daily-upgrade.timer)
+declare -A TIMER_WAS_ENABLED TIMER_WAS_ACTIVE
 # record the admin enablement state without failing on a new install
 if systemctl is-enabled --quiet adsb-admin 2>/dev/null; then
     ADMIN_WAS_ENABLED=true
@@ -69,6 +77,10 @@ fi
 # record the controller enablement state without failing on a new install
 if systemctl is-enabled --quiet adsb-controller 2>/dev/null; then
     CONTROLLER_WAS_ENABLED=true
+fi
+# record notifier enablement without failing on a first install
+if systemctl is-enabled --quiet adsb-alerts 2>/dev/null; then
+    ALERTS_WAS_ENABLED=true
 fi
 # record the admin process state without failing on a new install
 if systemctl is-active --quiet adsb-admin 2>/dev/null; then
@@ -78,6 +90,42 @@ fi
 if systemctl is-active --quiet adsb-controller 2>/dev/null; then
     CONTROLLER_WAS_ACTIVE=true
 fi
+# record notifier process state without failing on a first install
+if systemctl is-active --quiet adsb-alerts 2>/dev/null; then
+    ALERTS_WAS_ACTIVE=true
+fi
+# retain each timer's activation state for a failed installation
+for timer in "${TIMER_UNITS[@]}"; do
+    TIMER_WAS_ENABLED[$timer]=false
+    TIMER_WAS_ACTIVE[$timer]=false
+    # record prior enablement without rejecting an absent new timer
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+        TIMER_WAS_ENABLED[$timer]=true
+    fi
+    # retain the previous running schedule
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+        TIMER_WAS_ACTIVE[$timer]=true
+    fi
+done
+
+# remove only auxiliary source containers from a failed activation
+remove_alert_source_containers() {
+    local service identifier
+    local -a identifiers
+    # inspect each fixed auxiliary service independently
+    for service in alert-source-1090 alert-source-978fallback; do
+        mapfile -t identifiers < <(docker ps -aq \
+            --filter label=com.docker.compose.project=adsb \
+            --filter "label=com.docker.compose.service=$service")
+        # remove only validated Docker identifiers
+        for identifier in "${identifiers[@]}"; do
+            # refuse unexpected command output during rollback
+            if [[ $identifier =~ ^[a-f0-9]{12,64}$ ]]; then
+                docker rm -f "$identifier" >/dev/null 2>&1
+            fi
+        done
+    done
+}
 
 # roll back every selected host artifact when activation fails
 cleanup_install() {
@@ -86,8 +134,25 @@ cleanup_install() {
     set +e
     # restore the previous release and integration files after activation begins
     if [[ "$ACTIVATION_STARTED" == true && "$ACTIVATION_COMPLETE" != true ]]; then
+        systemctl stop adsb-alerts 2>/dev/null
+        systemctl stop adsb-controller 2>/dev/null
+        remove_alert_source_containers
+        systemctl stop "${TIMER_UNITS[@]}" 2>/dev/null
         rollback_activation "" "$ROLLBACK_DIR" "$CURRENT_CODE" "$PREVIOUS_MAP" "$LEGACY_LAYOUT" "$APP_RELEASE" "$MAP_RELEASE"
         systemctl daemon-reload
+        # restore each timer without enabling work that was previously disabled
+        for timer in "${TIMER_UNITS[@]}"; do
+            # preserve prior enablement while removing new wants links
+            if [[ "${TIMER_WAS_ENABLED[$timer]}" == true ]]; then
+                systemctl enable "$timer"
+            else
+                systemctl disable "$timer" 2>/dev/null
+            fi
+            # restart only timers that were already running
+            if [[ "${TIMER_WAS_ACTIVE[$timer]}" == true ]]; then
+                systemctl start "$timer"
+            fi
+        done
         # restore the prior unit enablement state
         if [[ "$ADMIN_WAS_ENABLED" == true ]]; then
             systemctl enable adsb-admin
@@ -100,6 +165,12 @@ cleanup_install() {
         else
             systemctl disable adsb-controller
         fi
+        # restore the prior notifier enablement state
+        if [[ "$ALERTS_WAS_ENABLED" == true ]]; then
+            systemctl enable adsb-alerts
+        else
+            systemctl disable adsb-alerts 2>/dev/null
+        fi
         # restore the prior admin process state
         if [[ "$ADMIN_WAS_ACTIVE" == true ]]; then
             systemctl restart adsb-admin
@@ -111,6 +182,12 @@ cleanup_install() {
             systemctl restart adsb-controller
         else
             systemctl stop adsb-controller
+        fi
+        # restart only a notifier that existed and was active before activation
+        if [[ "$ALERTS_WAS_ACTIVE" == true ]]; then
+            systemctl restart adsb-alerts
+        else
+            systemctl stop adsb-alerts 2>/dev/null
         fi
     fi
     # remove every unselected or failed release
@@ -202,6 +279,61 @@ if "ADSB_ADMIN_FRAME_ORIGIN" in values:
     _canonical_frame_origin(values["ADSB_ADMIN_FRAME_ORIGIN"])
 PY
 
+# validate the fixed alert source scripts and selection before activation
+bash -n "$APP_RELEASE/deploy/alerts/run-source.sh" "$APP_RELEASE/deploy/alerts/source-health.sh"
+[[ -x "$APP_RELEASE/deploy/alerts/run-source.sh" && -x "$APP_RELEASE/deploy/alerts/source-health.sh" ]] || {
+    printf '%s\n' 'alert source scripts must be executable' >&2
+    exit 1
+}
+python3 -B - "$APP_RELEASE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from adsb_admin.controller import validate_source_contract, validate_source_proof
+from datetime import datetime, timezone
+
+release = Path(sys.argv[1])
+contract = release / "deploy/alerts/source-contract.json"
+validate_source_contract(json.loads(contract.read_text(encoding="utf-8")))
+proof_path = release / "deploy/alerts/source-proof.json"
+# reject oversized evidence before the activation transaction
+if proof_path.stat().st_size > 64 * 1024:
+    raise SystemExit("alert source proof is oversized")
+proof = json.loads(proof_path.read_text(encoding="utf-8"))
+images = json.loads((release / "deploy/images.json").read_text(encoding="utf-8"))
+catalog = json.loads((release / "deploy/alerts/catalog-manifest.json").read_text(encoding="utf-8"))
+validate_source_proof(proof, images, (release / "deploy/alerts/source-health.sh").read_bytes(), catalog["entry_count"])
+captured = datetime.strptime(proof["production_headroom"]["captured_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+# require a fresh capacity observation for this activation, not steady reconciliation
+if not 0 <= (datetime.now(timezone.utc) - captured).total_seconds() <= 86400:
+    raise SystemExit("alert source headroom proof is stale")
+PY
+
+# verify the private publication and worker-state ownership contract
+[[ $(stat -c '%U:%G:%a' /var/lib/adsb/alerts) == adsb:adsb:700 &&
+   $(stat -c '%U:%G:%a' /var/lib/adsb/alert-source) == root:adsb:2750 &&
+   $(stat -c '%U:%G:%a' /var/lib/adsb/alert-source/1090) == root:adsb:2750 &&
+   $(stat -c '%U:%G:%a' /var/lib/adsb/alert-source/978) == root:adsb:2750 ]] || {
+    printf '%s\n' 'alert state directory permissions are invalid' >&2
+    exit 1
+}
+
+# seed or validate disabled private alert settings before the read-only worker starts
+python3 -B - "$APP_RELEASE" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from adsb_admin.alert_config import AlertSettingsStore
+
+path = Path("/var/lib/adsb/config/alerts.json")
+AlertSettingsStore(path)
+PY
+chown adsb:adsb /var/lib/adsb/config/alerts.json
+chmod 600 /var/lib/adsb/config/alerts.json
+
 # verify image availability before any live file or pointer changes
 python3 - "$APP_RELEASE" <<'PY'
 import json
@@ -221,17 +353,29 @@ STACK_TEMP="/usr/local/sbin/adsb-stack.$$.next"
 SUDOERS_TEMP="/etc/sudoers.d/adsb-stack.$$.next"
 ADMIN_UNIT_TEMP="/etc/systemd/system/adsb-admin.service.$$.next"
 CONTROLLER_UNIT_TEMP="/etc/systemd/system/adsb-controller.service.$$.next"
-TEMP_PATHS+=("$ADMIN_TEMP" "$RUNTIME_TEMP" "$STACK_TEMP" "$SUDOERS_TEMP" "$ADMIN_UNIT_TEMP" "$CONTROLLER_UNIT_TEMP")
+ALERTS_UNIT_TEMP="/etc/systemd/system/adsb-alerts.service.$$.next"
+TEMP_PATHS+=("$ADMIN_TEMP" "$RUNTIME_TEMP" "$STACK_TEMP" "$SUDOERS_TEMP" "$ADMIN_UNIT_TEMP" "$CONTROLLER_UNIT_TEMP" "$ALERTS_UNIT_TEMP")
 install -o root -g root -m 600 "$ADMIN_ENV" "$ADMIN_TEMP"
 install -o root -g root -m 755 "$APP_RELEASE/deploy/adsb-stack" "$STACK_TEMP"
 install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-admin.service" "$ADMIN_UNIT_TEMP"
 install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-controller.service" "$CONTROLLER_UNIT_TEMP"
+install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-alerts.service" "$ALERTS_UNIT_TEMP"
+# prepare weekly maintenance files without modifying active host configuration
+for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
+    destination="${artifact%%|*}"
+    install -d -o root -g root -m 755 "$(dirname -- "$destination")"
+    temporary="$destination.$$.next"
+    install -o root -g root -m 644 "$APP_RELEASE/deploy/${artifact##*|}" "$temporary"
+    TEMP_PATHS+=("$temporary")
+done
 cat >"$SUDOERS_TEMP" <<'EOF'
 admin ALL=(root) NOPASSWD: /usr/local/sbin/adsb-stack status, /usr/local/sbin/adsb-stack start, /usr/local/sbin/adsb-stack stop, /usr/local/sbin/adsb-stack restart
 EOF
 chmod 440 "$SUDOERS_TEMP"
 /usr/sbin/visudo -cf "$SUDOERS_TEMP"
-systemd-analyze verify "$APP_RELEASE/deploy/adsb-admin.service" "$APP_RELEASE/deploy/adsb-controller.service"
+systemd-analyze verify "$APP_RELEASE/deploy/adsb-admin.service" "$APP_RELEASE/deploy/adsb-controller.service" \
+    "$APP_RELEASE/deploy/adsb-alerts.service" "$APP_RELEASE/deploy/adsb-maintenance.service" \
+    "$APP_RELEASE/deploy/adsb-maintenance.timer"
 
 # prepare the next runtime document while preserving the existing tunnel choice
 python3 -B - "$APP_RELEASE" "$RUNTIME_TEMP" "$ACTIVATION_ID" <<'PY'
@@ -260,6 +404,12 @@ backup_activation_files "" "$ROLLBACK_DIR"
 
 # activate the prepared release and host files under rollback protection
 ACTIVATION_STARTED=true
+# stop the old worker before changing its immutable release pointer
+worker_load_state=$(systemctl show adsb-alerts.service --property=LoadState --value)
+# a first installation has no existing worker to drain
+if [[ "$worker_load_state" != not-found ]]; then
+    systemctl stop adsb-alerts
+fi
 ln -s "$APP_RELEASE" "/opt/adsb/current.$$.next"
 mv -Tf "/opt/adsb/current.$$.next" /opt/adsb/current
 ln -s "$MAP_RELEASE" "/opt/adsb/map-ui.$$.next"
@@ -270,24 +420,38 @@ mv -f "$STACK_TEMP" /usr/local/sbin/adsb-stack
 mv -f "$SUDOERS_TEMP" /etc/sudoers.d/adsb-stack
 mv -f "$ADMIN_UNIT_TEMP" /etc/systemd/system/adsb-admin.service
 mv -f "$CONTROLLER_UNIT_TEMP" /etc/systemd/system/adsb-controller.service
+mv -f "$ALERTS_UNIT_TEMP" /etc/systemd/system/adsb-alerts.service
+# select reviewed weekly schedules alongside the application release
+for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
+    destination="${artifact%%|*}"
+    mv -f "$destination.$$.next" "$destination"
+done
 systemctl daemon-reload
-systemctl enable adsb-admin adsb-controller
+systemctl enable adsb-admin adsb-controller adsb-alerts
 systemctl restart adsb-admin adsb-controller
+systemctl restart adsb-alerts
 
 # require the complete controller and container projection before accepting activation
-for _attempt in $(seq 1 30); do
+for _attempt in $(seq 1 45); do
     # stop waiting only after every declared service reaches full readiness
-    if /usr/local/sbin/adsb-stack status >/dev/null 2>&1; then
-        ACTIVATION_COMPLETE=true
+    if stack_status=$(/usr/local/sbin/adsb-stack status 2>/dev/null) && \
+        printf '%s' "$stack_status" | python3 -c \
+            'import json,sys; value=json.load(sys.stdin); raise SystemExit(not (value.get("state") == "running" and value.get("alerts", {}).get("infrastructure_ready") is True))'; then
+        APPLICATION_READY=true
         break
     fi
     sleep 2
 done
 # trigger the rollback trap when bounded readiness expires
-if [[ "$ACTIVATION_COMPLETE" != true ]]; then
+if [[ "$APPLICATION_READY" != true ]]; then
     printf '%s\n' 'activation readiness failed; restoring the previous release' >&2
     exit 1
 fi
+
+# enable scheduled work only after application readiness has been verified
+systemctl enable "${TIMER_UNITS[@]}"
+systemctl restart "${TIMER_UNITS[@]}"
+ACTIVATION_COMPLETE=true
 
 # remove inactive legacy code only after successful activation
 if [[ "$LEGACY_LAYOUT" == true ]]; then

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Tuesday ADS-B maintenance
+
+[Timer]
+OnCalendar=Tue *-*-* 04:30:00 America/Los_Angeles
+RandomizedDelaySec=0
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

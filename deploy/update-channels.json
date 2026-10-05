@@ -1,0 +1,8 @@
+{
+  "ultrafeeder": "ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest",
+  "piaware": "ghcr.io/sdr-enthusiasts/docker-piaware:latest",
+  "airspy": "ghcr.io/sdr-enthusiasts/airspy_adsb:latest",
+  "dump978": "ghcr.io/sdr-enthusiasts/docker-dump978:latest",
+  "proxy": "nginx:stable-alpine",
+  "cloudflared": "cloudflare/cloudflared:latest"
+}

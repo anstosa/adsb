@@ -68,6 +68,340 @@
           </div>
         </section>
 
+        <section class="panel reception-panel" aria-labelledby="reception-heading">
+          <div class="section-heading reception-heading">
+            <div>
+              <div class="eyebrow">Radio diagnostics</div>
+              <h2 id="reception-heading">Reception health</h2>
+              <p>Source-specific counters distinguish live radio traffic from a running decoder or a fresh JSON file.</p>
+            </div>
+            <a class="button button-quiet" href="/map/graphs1090/" target="_blank" rel="noopener noreferrer">View performance graphs <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="reception-grid">
+            <article class="reception-card" data-reception-band="1090">
+              <div class="reception-card-heading">
+                <div>
+                  <h3>1090 MHz</h3>
+                  <small>Airspy Mode-S / ADS-B</small>
+                </div>
+                <span class="reception-state reception-unavailable" id="reception-1090-state">Unavailable</span>
+              </div>
+              <p class="reception-detail" id="reception-1090-detail">No source telemetry reported.</p>
+              <dl class="reception-details">
+                <div>
+                  <dt>Message rate</dt>
+                  <dd id="reception-1090-rate">—</dd>
+                </div>
+                <div>
+                  <dt>Last positive sample</dt>
+                  <dd id="reception-1090-last">—</dd>
+                </div>
+                <div>
+                  <dt>Telemetry updated</dt>
+                  <dd id="reception-1090-sample">—</dd>
+                </div>
+              </dl>
+            </article>
+            <article class="reception-card" data-reception-band="978">
+              <div class="reception-card-heading">
+                <div>
+                  <h3>978 MHz</h3>
+                  <small>UAT receiver</small>
+                </div>
+                <span class="reception-state reception-unavailable" id="reception-978-state">Unavailable</span>
+              </div>
+              <p class="reception-detail" id="reception-978-detail">No source telemetry reported.</p>
+              <dl class="reception-details">
+                <div>
+                  <dt>Message rate</dt>
+                  <dd id="reception-978-rate">—</dd>
+                </div>
+                <div>
+                  <dt>Last positive sample</dt>
+                  <dd id="reception-978-last">—</dd>
+                </div>
+                <div>
+                  <dt>Telemetry updated</dt>
+                  <dd id="reception-978-sample">—</dd>
+                </div>
+              </dl>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel maintenance-panel" aria-labelledby="maintenance-heading">
+          <div class="section-heading maintenance-heading">
+            <div>
+              <div class="eyebrow">Weekly review</div>
+              <h2 id="maintenance-heading">Software maintenance</h2>
+            </div>
+            <span class="maintenance-state maintenance-unknown" id="maintenance-state">Report unavailable</span>
+          </div>
+          <p class="maintenance-summary" id="maintenance-summary">No completed maintenance report has been received.</p>
+          <dl class="maintenance-details">
+            <div>
+              <dt>Last review</dt>
+              <dd id="maintenance-updated">—</dd>
+            </div>
+            <div>
+              <dt>OS update schedule</dt>
+              <dd id="maintenance-schedule">Tuesdays 04:00 America/Los_Angeles</dd>
+            </div>
+            <div>
+              <dt>Application policy</dt>
+              <dd id="maintenance-policy">Pinned releases; updates require review</dd>
+            </div>
+            <div>
+              <dt>Disk free</dt>
+              <dd id="maintenance-disk">—</dd>
+            </div>
+            <div>
+              <dt>Reboot required</dt>
+              <dd id="maintenance-reboot">Unknown</dd>
+            </div>
+            <div>
+              <dt>Release review</dt>
+              <dd id="maintenance-releases">Unknown</dd>
+            </div>
+            <div>
+              <dt>Email notification</dt>
+              <dd id="maintenance-email-notification">SMTP not configured</dd>
+            </div>
+          </dl>
+          <p class="maintenance-note">Security updates may restart receiver services. Reboots are reported for review and are not performed automatically.</p>
+          <p class="maintenance-note">One email is queued for each new completed maintenance review when the shared SMTP settings below are configured. Older reports are not replayed, and Pushover is not used.</p>
+        </section>
+
+        <section class="alerts-shell" aria-labelledby="alerts-heading">
+          <div class="panel alerts-overview">
+            <div class="section-heading alerts-heading">
+              <div>
+                <div class="eyebrow">Station-local notifications</div>
+                <h2 id="alerts-heading">Aircraft alerts</h2>
+                <p>Send one Pushover notification and one email for each qualifying local encounter. An aircraft becomes eligible again only after at least 10 minutes of verified absence.</p>
+              </div>
+              <span class="alert-state alert-unknown" id="alerts-overall-state">Loading</span>
+            </div>
+
+            <div class="alert-health-grid" aria-label="Alert service health">
+              <article class="alert-health-card">
+                <span class="alert-health-label">Worker</span>
+                <strong id="alerts-worker-state">Unknown</strong>
+                <small id="alerts-worker-detail">Status has not loaded.</small>
+              </article>
+              <article class="alert-health-card">
+                <span class="alert-health-label">Local source</span>
+                <strong id="alerts-source-state">Unknown</strong>
+                <small id="alerts-source-detail">Status has not loaded.</small>
+              </article>
+              <article class="alert-health-card">
+                <span class="alert-health-label">Pushover</span>
+                <strong id="alerts-pushover-state">Unknown</strong>
+                <small id="alerts-pushover-detail">Status has not loaded.</small>
+              </article>
+              <article class="alert-health-card">
+                <span class="alert-health-label">Email</span>
+                <strong id="alerts-email-state">Unknown</strong>
+                <small id="alerts-email-detail">Status has not loaded.</small>
+              </article>
+            </div>
+
+            <dl class="alert-runtime-details">
+              <div>
+                <dt>1090 MHz</dt>
+                <dd id="alerts-1090-state">Unknown</dd>
+                <dd class="detail-time" id="alerts-1090-time">Last message —</dd>
+              </div>
+              <div>
+                <dt>978 MHz</dt>
+                <dd id="alerts-978-state">Unknown</dd>
+                <dd class="detail-time" id="alerts-978-time">Last message —</dd>
+              </div>
+              <div>
+                <dt>Applied alert revision</dt>
+                <dd id="alerts-applied-revision">—</dd>
+                <dd class="detail-time" id="alerts-status-sampled">Sampled —</dd>
+              </div>
+              <div>
+                <dt>Classification catalog</dt>
+                <dd id="alerts-catalog-version">Unknown</dd>
+                <dd class="detail-time" id="alerts-catalog-detail">Coverage unavailable</dd>
+              </div>
+            </dl>
+
+            <p class="coverage-note" id="alerts-coverage-note">The built-in catalog and exact watchlist overrides identify known aircraft roles. A match does not establish an active military, medical, or news mission.</p>
+          </div>
+
+          <form class="panel alerts-form" id="alerts-form" novalidate>
+            <div class="section-heading alerts-form-heading">
+              <div>
+                <div class="eyebrow">Notification settings</div>
+                <h3>Delivery and watchlist</h3>
+              </div>
+              <span class="revision-label" id="alerts-revision-label">Revision —</span>
+            </div>
+
+            <fieldset class="alerts-config-controls" id="alerts-config-controls" disabled>
+              <div class="alert-enable-row">
+                <div>
+                  <strong>Enable aircraft alerts</strong>
+                  <p>Both Pushover and email must be configured. Pushover uses normal priority and respects device quiet hours.</p>
+                </div>
+                <label class="switch-control">
+                  <span class="switch-label">Alerts enabled</span>
+                  <input id="alerts-enabled" type="checkbox" role="switch">
+                  <span class="switch-track" aria-hidden="true"></span>
+                </label>
+              </div>
+
+              <fieldset class="alert-fieldset">
+                <legend>Aircraft categories</legend>
+                <p class="fieldset-help">Select every known role that should create an alert. Familiar and frequently seen aircraft still qualify.</p>
+                <div class="category-options">
+                  <label class="check-card" for="alerts-category-military">
+                    <input id="alerts-category-military" type="checkbox" value="military" checked>
+                    <span><strong>Military</strong><small>Known military identities</small></span>
+                  </label>
+                  <label class="check-card" for="alerts-category-medical">
+                    <input id="alerts-category-medical" type="checkbox" value="medical" checked>
+                    <span><strong>Medical</strong><small>Known air-ambulance identities</small></span>
+                  </label>
+                  <label class="check-card" for="alerts-category-news">
+                    <input id="alerts-category-news" type="checkbox" value="news" checked>
+                    <span><strong>News</strong><small>Known news and media aircraft</small></span>
+                  </label>
+                </div>
+                <small class="input-error" id="alerts-categories-error" hidden></small>
+              </fieldset>
+
+              <div class="alert-provider-grid">
+                <fieldset class="alert-fieldset provider-card">
+                  <legend>Pushover</legend>
+                  <p class="fieldset-help">Credentials stay private. Saved values are never returned to this browser.</p>
+                  <div class="field">
+                    <div class="credential-heading">
+                      <label for="alerts-pushover-token">Application token</label>
+                      <span class="credential-state" id="alerts-pushover-token-state">Not configured</span>
+                    </div>
+                    <input id="alerts-pushover-token" type="password" autocomplete="new-password" maxlength="256" placeholder="Leave blank to preserve saved token" aria-describedby="alerts-pushover-token-help alerts-pushover-token-error">
+                    <small id="alerts-pushover-token-help">Enter a value only to add or replace the saved token.</small>
+                    <small class="input-error" id="alerts-pushover-token-error" hidden></small>
+                    <button class="text-button credential-clear" id="alerts-pushover-token-clear" type="button" hidden>Clear saved application token</button>
+                  </div>
+                  <div class="field">
+                    <div class="credential-heading">
+                      <label for="alerts-pushover-user-key">User or group key</label>
+                      <span class="credential-state" id="alerts-pushover-user-key-state">Not configured</span>
+                    </div>
+                    <input id="alerts-pushover-user-key" type="password" autocomplete="new-password" maxlength="256" placeholder="Leave blank to preserve saved key" aria-describedby="alerts-pushover-user-key-help alerts-pushover-user-key-error">
+                    <small id="alerts-pushover-user-key-help">The normal-priority notification will honor Pushover quiet hours.</small>
+                    <small class="input-error" id="alerts-pushover-user-key-error" hidden></small>
+                    <button class="text-button credential-clear" id="alerts-pushover-user-key-clear" type="button" hidden>Clear saved user key</button>
+                  </div>
+                </fieldset>
+
+                <fieldset class="alert-fieldset provider-card">
+                  <legend>Email</legend>
+                  <p class="fieldset-help">SMTP connections require verified TLS on port 465 or STARTTLS on port 587.</p>
+                  <p class="fieldset-help">These settings also send software-maintenance email even when aircraft alerts are off. Pushover is not required for maintenance notices.</p>
+                  <div class="smtp-grid">
+                    <div class="field field-wide">
+                      <label for="alerts-smtp-host">SMTP hostname</label>
+                      <input id="alerts-smtp-host" type="text" autocomplete="off" maxlength="253" placeholder="smtp.example.com" aria-describedby="alerts-smtp-host-error">
+                      <small class="input-error" id="alerts-smtp-host-error" hidden></small>
+                    </div>
+                    <div class="field">
+                      <label for="alerts-smtp-port">SMTP port</label>
+                      <select id="alerts-smtp-port">
+                        <option value="465">465 — TLS</option>
+                        <option value="587">587 — STARTTLS</option>
+                      </select>
+                      <small class="input-error" id="alerts-smtp-port-error" hidden></small>
+                    </div>
+                    <div class="field field-wide">
+                      <div class="credential-heading">
+                        <label for="alerts-smtp-username">SMTP username</label>
+                        <span class="credential-state" id="alerts-smtp-username-state">Not configured</span>
+                      </div>
+                      <input id="alerts-smtp-username" type="password" autocomplete="new-password" maxlength="256" placeholder="Leave blank to preserve saved username" aria-describedby="alerts-smtp-username-error">
+                      <small class="input-error" id="alerts-smtp-username-error" hidden></small>
+                      <button class="text-button credential-clear" id="alerts-smtp-username-clear" type="button" hidden>Clear saved username</button>
+                    </div>
+                    <div class="field field-wide">
+                      <div class="credential-heading">
+                        <label for="alerts-smtp-password">SMTP password</label>
+                        <span class="credential-state" id="alerts-smtp-password-state">Not configured</span>
+                      </div>
+                      <input id="alerts-smtp-password" type="password" autocomplete="new-password" maxlength="256" placeholder="Leave blank to preserve saved password" aria-describedby="alerts-smtp-password-error">
+                      <small class="input-error" id="alerts-smtp-password-error" hidden></small>
+                      <button class="text-button credential-clear" id="alerts-smtp-password-clear" type="button" hidden>Clear saved password</button>
+                    </div>
+                    <div class="field field-wide">
+                      <label for="alerts-smtp-from">From address</label>
+                      <input id="alerts-smtp-from" type="email" autocomplete="off" maxlength="254" placeholder="receiver@example.com" aria-describedby="alerts-smtp-from-error">
+                      <small class="input-error" id="alerts-smtp-from-error" hidden></small>
+                    </div>
+                    <div class="field field-wide">
+                      <label for="alerts-smtp-to">Recipient address</label>
+                      <input id="alerts-smtp-to" type="email" autocomplete="off" maxlength="254" placeholder="you@example.com" aria-describedby="alerts-smtp-to-error">
+                      <small class="input-error" id="alerts-smtp-to-error" hidden></small>
+                    </div>
+                  </div>
+                </fieldset>
+              </div>
+
+              <fieldset class="alert-fieldset override-fieldset">
+                <legend>Exact ICAO overrides</legend>
+                <div class="fieldset-heading">
+                  <div>
+                    <p class="fieldset-help">Include or exclude one six-character hexadecimal ICAO address. Overrides do not infer roles from aircraft model, squawk, or a generic helicopter label.</p>
+                  </div>
+                  <button class="button button-quiet" id="alerts-add-override" type="button">Add aircraft</button>
+                </div>
+                <div class="override-list" id="alerts-override-list"></div>
+                <p class="empty-state compact" id="alerts-overrides-empty">No exact aircraft overrides.</p>
+                <small class="input-error" id="alerts-overrides-error" hidden></small>
+              </fieldset>
+
+              <p class="form-error" id="alerts-form-error" role="alert" hidden></p>
+              <div class="alert-form-actions">
+                <div>
+                  <div class="save-message" id="alerts-save-message" role="status" aria-live="polite"></div>
+                  <small>Saving settings does not send a test notification.</small>
+                </div>
+                <button class="button button-primary" id="alerts-save-button" type="submit">Save alert settings</button>
+              </div>
+            </fieldset>
+          </form>
+
+          <div class="panel alert-test-panel">
+            <div>
+              <div class="eyebrow">Delivery check</div>
+              <h3>Send an intentional test</h3>
+              <p>This sends a clearly labeled non-aircraft test to both configured channels. “Queued” means the request was recorded, not delivered, accepted, read, or received.</p>
+              <div class="test-channel-results" id="alerts-test-results" aria-live="polite"></div>
+              <p class="save-message" id="alerts-test-message" role="status" aria-live="polite"></p>
+            </div>
+            <button class="button button-quiet" id="alerts-test-button" type="button" disabled>Queue test notification</button>
+          </div>
+
+          <div class="panel alert-history-panel">
+            <div class="section-heading alert-history-heading">
+              <div>
+                <div class="eyebrow">Private 30-day record</div>
+                <h3>Recent notification history</h3>
+                <p>Channel states are independent. Provider acceptance does not confirm a phone display, inbox delivery, or read receipt.</p>
+              </div>
+              <button class="button button-quiet" id="alerts-history-refresh" type="button">Refresh</button>
+            </div>
+            <p class="empty-state" id="alerts-history-loading">Loading notification history…</p>
+            <p class="form-error" id="alerts-history-error" role="alert" hidden></p>
+            <p class="empty-state" id="alerts-history-empty" hidden>No notification attempts in the last 30 days.</p>
+            <div class="alert-history-list" id="alerts-history-list"></div>
+            <button class="button button-quiet history-more" id="alerts-history-more" type="button" hidden>Load older events</button>
+          </div>
+        </section>
+
         <form id="settings-form" novalidate>
           <section class="panel station-panel" aria-labelledby="station-heading">
             <div class="section-heading">

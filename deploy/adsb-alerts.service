@@ -1,0 +1,33 @@
+[Unit]
+Description=Ballydidean ADS-B aircraft alert worker
+After=network-online.target adsb-controller.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adsb
+Group=adsb
+WorkingDirectory=/opt/adsb/current
+ExecStart=/usr/bin/python3 -B -m adsb_admin.alerts
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/adsb /var/lib/adsb/config /var/lib/adsb/status /var/lib/adsb/alert-source /opt/adsb/current
+ReadWritePaths=/var/lib/adsb/alerts
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryMax=96M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 # Ballydidean Farm ADS-B station
 
-Hardware-free production staging for an Airspy Mini (1090 MHz) and an ADSBx Orange RTL-SDR (978 MHz). The public map is at `/map/`; password-protected configuration is at `/admin`.
+Receiver software for an Airspy Mini (1090 MHz) and an ADSBx Orange RTL-SDR (978 MHz), with safe hardware-free staging. The public map is at `/map/`; password-protected configuration and reception diagnostics are at `/admin`.
 
 **Production target:** <https://adsb.ballydidean.farm/admin>. This URL is not evidence of deployment: verify it after installing the origin and enabling its dedicated Cloudflare Tunnel.
 
@@ -31,6 +31,51 @@ Fill the station name, actual antenna latitude/longitude, and elevation in metre
 `enabled` is the saved request; `applied_revision` identifies settings processed by the controller. A running uploader is not the same as a TCP connection, and neither proves acceptance by the upstream provider. Receiver USB presence does not prove successful RF reception. Missing connector telemetry remains unknown rather than being reported as a remote disconnection. Requested containers that stop or become unhealthy put the controller into an error phase and are force-recreated within the fixed Compose project. Without hardware, the expected state is an empty map and **awaiting radios**.
 
 PiAware container health tracks the local PiAware process rather than recent message volume. Provider connectivity and received radio traffic remain separate runtime observations, so a quiet receiver does not make a functioning uploader process unhealthy.
+
+### Reception diagnostics and graphs
+
+The authenticated admin shows separate 1090 MHz and 978 MHz reception observations: message rate, source sample time, and the last positive reception sample seen by the controller. Airspy uses its one-minute Mode-S counters; UAT uses changes in dump978's cumulative receiver counter. These observations do not confuse combined readsb inputs or MLAT returns with local 1090 reception. A current source with no messages is **quiet**, not broken; absent hardware, stopped services, unavailable telemetry, and stale samples remain distinct. A fresh JSON timestamp alone does not prove reception. Activity timestamps are sampled observations, not exact per-message reception times, and reset when the controller restarts.
+
+Built-in reception and system graphs are at `/map/graphs1090/`. Airspy and UAT statistics are connected to graphs1090, and its round-robin database is persisted at `/var/lib/adsb/collectd` across container recreation. Receiver telemetry ports remain bound to loopback; they are not published by the tunnel. Existing UptimeRobot and FlightAware monitoring remain unchanged.
+
+### Own-receiver aircraft notifications
+
+The **Aircraft alerts** section at <https://adsb.ballydidean.farm/admin> sends normal-priority **Pushover** and **SMTP email** for locally received military, medical/air-ambulance, and news aircraft. All three roles are selected by default; there is no rarity or distance filter. Alerts start **disabled** and require both channels to be configured privately before enabling. Enter the Pushover application token/user key and SMTP host, TLS port (465 or 587), login, sender, and recipient in the protected admin. SMTP can be configured while aircraft alerts remain off because maintenance email uses it independently; Pushover is not required for maintenance notices. Saved credentials are write-only; blank replacement fields preserve them. Saving settings never sends a test. The explicit **Queue test notification** action creates a clearly labeled non-aircraft test, with independent channel results.
+
+One ICAO encounter creates one event across both bands. A brief disappearance does not repeat the notification: a new encounter requires at least **600 seconds of continuously verified absence** on every required band. Restart, disconnection, unknown input activity, stale output, or missing previously required hardware cannot establish absence. Source startup snapshots are baselined rather than replayed. Only the separate physical-input trackers qualify aircraft; network/MLAT-only map traffic cannot trigger alerts. TIS-B/rebroadcast is explicitly labeled and may describe relayed traffic rather than direct aircraft reception. Roles describe usual aircraft/operator use, **not a confirmed current mission**.
+
+The bundled, versioned catalog retains attribution and licensing under `deploy/alerts/`; it is incomplete, especially for medical and news aircraft. Exact six-digit ICAO include/exclude overrides can correct coverage without guessing from callsigns. The private history retains 30 days of events and independent provider outcomes. **Accepted** means Pushover or the SMTP server accepted the send, not phone or inbox receipt. Ambiguous post-send failures are shown as unknown and are not automatically resent; transient retries have a five-minute deadline. The normal available-channel dispatch target is 30 seconds, not a guarantee during provider outages or overload.
+
+The unprivileged `adsb-alerts` worker uses a 96 MiB memory limit, a private single-writer SQLite database, two bounded sender threads per channel, 1,000 pending events, 10,000 continuity identities, and a 256 MiB database ceiling. Capacity refusals remain visible in admin status rather than reporting all alerts healthy. Each isolated readsb source has a 64 MiB limit: the selected two-source fallback adds **224 MiB** including the worker, with no new image or host port. The exact-pin native 978 evaluation and fallback rationale, isolated decoder/worker proofs, and resource evidence are release-owned in `deploy/alerts/SOURCE-PROOF.md` and `source-proof.json`; their bytes are bound into the activation contract digest. Fresh kernel socket samples independently bracket ten-second accepted-message statistics, so a quiet receiver is distinguished from active input with stalled decoding. The one-second post-probe Docker interval budgets receiver startup overhead without relaxing the seven-second freshness limit.
+
+Source or provider failures degrade only alert status, not existing feeders or the core stack status. Install/start/restart readiness additionally checks that the worker consumed the expected source generations. Encrypted backups include private alert settings, the unit, and complete conservative encounter continuity; recovery restores **no historical delivery backlog**. Live both-channel acceptance must be verified after real credentials are entered through the admin. Never enter secrets in chat or use simulated aircraft against production/provider endpoints.
+
+### Retention and Tuesday maintenance
+
+Aircraft heatmap/replay history is capped at **30 days** with ultrafeeder's `MAX_GLOBE_HISTORY`. Graphs1090 uses its own fixed-size round-robin history rather than an unbounded sample database. Weekly cleanup also removes installer-named application releases, unreferenced map releases, and code archives older than 30 days. The selected application and map, the two newest application releases, and maps referenced by retained applications are protected. Cleanup does not prune Docker images, private settings, feeder identities, or off-host backups.
+
+Schedules use **America/Los_Angeles**, including daylight-saving time:
+
+| Tuesday time | Operation |
+| --- | --- |
+| 03:45 | Refresh Ubuntu package indexes through `apt-daily.timer` |
+| 04:00 | Apply Ubuntu security updates through `apt-daily-upgrade.timer` |
+| 04:30 | Check pinned application/map update candidates and expire old release artifacts |
+
+Timers are persistent: a missed run catches up when the machine returns. Automatic reboots are disabled; security package updates may restart affected services. The policy permits Ubuntu's security pockets and base-release dependencies, not general `-updates`, PPAs, or distribution upgrades.
+
+Application/container upgrades remain reviewed immutable deployments. `deploy/update-channels.json` names advisory upstream channels; the weekly job compares the current and candidate **linux/amd64** manifest digests without pulling images or changing pins. Those channels are review candidates, not claims of drop-in compatibility. The custom map's pinned source commit is compared with upstream `prod`. Registry/API failures remain unknown rather than reporting that software is current. The admin maintenance card shows review results, disk headroom, pending reboot status, and the independent email outcome; reports older than eight days become unknown.
+
+Each newly completed maintenance report queues one **SMTP-only** email when the shared private SMTP settings are complete. This is independent of the aircraft-alert enabled switch and Pushover configuration. Reports completed before notification support or before SMTP configuration are not replayed. The message reports the review result; it does not claim updates were installed, trigger a reboot, or perform application/container upgrades. Live SMTP acceptance remains unverified until real credentials are entered privately through the admin.
+
+Inspect or rerun the non-upgrading review with:
+
+```sh
+systemctl list-timers apt-daily.timer apt-daily-upgrade.timer adsb-maintenance.timer
+journalctl -u adsb-maintenance.service
+sudo python3 -I -B /opt/adsb/current/adsb_admin/maintenance.py --report-only
+sudo unattended-upgrade --dry-run -v
+```
 
 New browsers center on the configured receiver site at zoom `9.802072478907773`, which displays a **5 mi** scale at the current site's latitude. This is the map's scale bar, not a five-mile radius or aircraft-distance filter. Until a site is configured, the previous display-only center (`47.98176459220005`, `-122.44336120839758`) remains the fallback; it is never sent to the decoder as an antenna position. Optional terrain-outline data is not configured during hardware-free staging.
 
@@ -82,8 +127,15 @@ Ultrafeeder serves this read-only bundle through its supported `CUSTOM_HTML` mou
 | `/etc/adsb/admin.env` | root-only password hash, not plaintext |
 | `/etc/adsb/runtime.json` | root-owned deployment image pins and tunnel flag |
 | `/var/lib/adsb/config/settings.json` | private persistent station/network settings |
+| `/var/lib/adsb/config/alerts.json` | private alert credentials, role toggles, and ICAO overrides |
+| `/var/lib/adsb/config/alerts-test.json` | admin-owned fixed test request and restart-safe rate limit |
+| `/var/lib/adsb/alerts` | private worker database, heartbeat, and backup continuity |
+| `/var/lib/adsb/alert-source` | root-owned group-readable physical tracker output |
 | `/var/lib/adsb/status/status.json` | private controller status and bounded claim route |
 | `/var/lib/adsb/piaware` | private provider-assigned PiAware identity state |
+| `/var/lib/adsb/collectd` | persistent graphs1090 round-robin statistics |
+| `/var/lib/adsb/tar1090` | aircraft history with 30-day retention |
+| `/var/lib/adsb/status/maintenance.json` | bounded weekly update-review and disk/reboot observations |
 | `/var/lib/adsb/runtime/compose.json` | private rendered container configuration |
 | `/var/lib/adsb/cloudflared` | root-only tunnel credentials and ingress configuration |
 
@@ -95,7 +147,7 @@ Prerequisites: Ubuntu 24.04 amd64, SSH access, authorized sudo, outbound package
 
 1. Generate a private environment file **outside this repository** using `adsb_admin.auth.make_password_hash`. Its required setting is `ADSB_ADMIN_PASSWORD_HASH='scrypt$...hash envelope...'`. Quoting is important if it is loaded by a shell; no plaintext password belongs in the file.
 2. Transfer this repository's `adsb_admin`, `web`, and `deploy` directories to a staging directory on `adsb`; transfer the private environment file separately with restrictive permissions.
-3. Run `sudo bash deploy/install.sh /path/to/private/admin.env`. It installs Ubuntu's Docker/Compose packages, pulls the pinned images, creates the unprivileged web user, and enables the two systemd services.
+3. Run `sudo bash deploy/install.sh /path/to/private/admin.env`. It installs Ubuntu's Docker/Compose packages, pulls the pinned images, creates the unprivileged web user, and enables the admin, controller, and alert-worker services plus maintenance timers.
 4. Verify `http://127.0.0.1:8080/healthz`, `/admin`, and `/map/` on the host. The map should be empty without radios. No network should be uploading.
 
 The site password supplied during implementation is stored only as a hash under the operator's private `~/.adsb/admin.env`; it is not included here.
@@ -154,6 +206,14 @@ shellcheck deploy/install.sh deploy/release-transaction.sh deploy/enable-tunnel.
 
 Use a private, separate settings directory for browser/integration tests. A local HTTP test server must opt into `--insecure-cookie` and an exact local `--origin`; do not use that flag in production. Never send recorded/synthetic data to provider endpoints.
 
+Rendered admin regressions are opt-in and use an existing Playwright installation without adding project dependencies:
+
+```sh
+ADSB_PLAYWRIGHT_MODULE=/absolute/path/to/node_modules/playwright node tests/admin-ui-regressions.mjs
+```
+
+The same environment variable enables the browser case during unittest discovery. The suite serves the actual admin assets on loopback with isolated API responses; it never contacts notification providers.
+
 Run read-only redirect checks against the real nginx proxy after deployment:
 
 ```bash
@@ -164,7 +224,38 @@ Both `/` and `/map` must redirect to relative `/map/`, without leaking the priva
 
 ## Operations and rollback
 
-Inspect `systemctl status adsb-admin adsb-controller` and their journals. Container state is available with `docker compose -p adsb -f /var/lib/adsb/runtime/compose.json ps`. Do not publish rendered environment or logs containing identifiers.
+### Encrypted off-host backups
+
+ADS-B uses the existing Blueberry backup engine on **Framework**, with a separate ADS-B configuration, catalog, storage root, age identity, SSH identity, and systemd units. Existing Blueberry archives and jobs are not migrated or changed. The receiver holds only the public age recipient; it streams an encrypted tar archive over a dedicated forced-command SSH account. The Framework private key and age identity remain outside Git in the owner-only `~/.config/blueberry-backups-adsb/` directory.
+
+Backups run daily at **03:00 America/Los_Angeles**, before Tuesday's security update window. Retained-generation integrity checks run daily at **19:00 UTC** (noon Pacific daylight time or 11:00 Pacific standard time), matching the existing Blueberry engine's integrity-cycle deadline. Each generation is published only after checksum verification, age decryption into private tmpfs, safe archive inspection, and validation of the receiver configuration and selected application/map release. This is a restore-content check, not a destructive restore onto the live receiver. The archive includes station/feed settings, the admin password hash, tunnel credentials, PiAware identity, the selected application and map, and the fixed host integration files. It also includes alert credentials and conservative encounter continuity, but never the alert database, outbox, or old delivery backlog. It excludes aircraft history, graphs, old releases, generated Compose/status, and the Framework private keys. The map's three approved container-only symlinks are verified before backup and reconstructed from the pinned manifest during recovery, rather than followed on the host.
+
+Source provisioning is separate from ordinary application upgrades:
+
+```sh
+sudo bash /opt/adsb/current/deploy/backup/install-source.sh /private/framework-backup.pub /private/adsb-age-recipient.txt
+```
+
+Installed root-owned entrypoints select their implementation from `/opt/adsb/current/deploy/backup/`, so future immutable application deployments also update backup logic. The backup SSH account permits only `backup-proof` and `backup-stream`, with no forwarding, terminal, arbitrary command, or general sudo access.
+
+Framework operational paths:
+
+| Path or unit | Purpose |
+| --- | --- |
+| `~/.config/blueberry-backups-adsb/adsb-backups.json` | private ADS-B-only engine configuration |
+| `~/.local/share/blueberry-backups-adsb/` | isolated encrypted generations and catalog |
+| `~/.local/state/blueberry-backups-adsb/` | isolated operational state and public-safe status snapshot |
+| `blueberry-backup-adsb.timer` | daily verified backup |
+| `blueberry-backup-adsb-integrity-scrub.timer` | daily retained-generation verification |
+| `blueberry-backup-adsb-prune.timer` | daily automatic deletion of expired, unprotected generations at 23:45 UTC |
+
+Use `systemctl --user status blueberry-backup-adsb.service` and its journal on Framework. Engine recovery instructions and the isolated profile template are in `/home/ubuntu/blueberry-backups/README.md` and `config/adsb-backups.example.json`. Keep a separately secured recovery copy of the age identity: losing it makes the encrypted archives unrecoverable.
+
+The engine keeps **7 daily, 5 weekly, and 12 monthly restore points per service**, with overlapping tiers sharing a generation. Automatic pruning physically deletes expired, unprotected encrypted generations daily at **23:45 UTC**, after the integrity-check window, with at most **7 oldest eligible generations per service per run**. The latest verified backup and verification/recovery pins are protected; a newer retained replacement must pass local verification before deletion. Catalog or integrity uncertainty and retention-reference disagreements stop pruning, and unknown files, quarantine, and source-host data are never swept. Use the engine's `prune --config <private-config>` command for a read-only dry run; only `--mode apply` permits deletion. Blueberry's Weather/Actionable profile follows the same policy at 23:30 UTC. This off-host policy is separate from the receiver's 30-day aircraft/release cleanup.
+
+### Stack operations
+
+Inspect `systemctl status adsb-admin adsb-controller adsb-alerts` and their journals. Container state is available with `docker compose -p adsb -f /var/lib/adsb/runtime/compose.json ps`. Do not publish rendered environment or logs containing identifiers.
 
 RemoteAgents runs `./deploy/remote-stack.sh status`, `start`, `stop`, or `restart` from this checkout. The SSH wrapper invokes only `/usr/local/sbin/adsb-stack` on `adsb`. Installation grants `admin` passwordless sudo for exactly those four arguments; no sudo password is stored in RemoteAgents. The root launcher uses an isolated Python interpreter, a clean environment, fixed paths, and the local Docker socket.
 
@@ -172,7 +263,7 @@ Status checks systemd, containers, the origin, fresh controller state, and Cloud
 
 The RemoteAgents project combines these commands with `externalUrl: "https://adsb.ballydidean.farm"`, not a fictitious local proxy port. Open and split view target the production site directly; external previews offer viewport sizing without proxy-based device emulation. The hostname must resolve and its Cloudflare tunnel must be healthy before the public preview works. Admin embedding additionally requires the exact `ADSB_ADMIN_FRAME_ORIGIN` opt-in above; the **Open** action remains the fallback for browsers without partitioned-cookie support.
 
-Installation stages an exact immutable application tree, prepares its matching map assets, and atomically updates `/opt/adsb/current`; obsolete files from an older release cannot remain active. A random activation identity prevents a fresh status from the previous controller from satisfying the new release's readiness gate. Installation also preserves a timestamped application-code archive in `/var/lib/adsb/runtime/` before selection. To roll back: stop `adsb-controller`, atomically repoint `/opt/adsb/current` to the previous directory under `/opt/adsb/releases`, restore the corresponding reviewed runtime image pins when necessary, and restart `adsb-admin` and `adsb-controller`. The selected application release includes its matching map-release link. Old releases, map releases, and backups are retained for operator-reviewed removal; monitor disk usage during repeated upgrades. Keep private settings and tunnel credentials intact. Stop the fixed `adsb` Compose project if immediate shutdown is needed; do not stop unrelated containers.
+Installation stages an exact immutable application tree, prepares its matching map assets, and atomically updates `/opt/adsb/current`; obsolete files from an older release cannot remain active. A random activation identity prevents a fresh status from the previous controller from satisfying the new release's readiness gate. Installation also preserves a timestamped application-code archive in `/var/lib/adsb/runtime/` before selection. To roll back: stop `adsb-alerts` and `adsb-controller`, atomically repoint `/opt/adsb/current` to the previous directory under `/opt/adsb/releases`, restore the corresponding reviewed runtime image pins when necessary, and restart `adsb-admin` and `adsb-controller`. Restart `adsb-alerts` only when the selected release includes the worker and matching source contract; disable the new unit when reverting to a pre-alert release. The selected application release includes its matching map-release link. Weekly maintenance expires installer-owned artifacts after 30 days while protecting the selected release, two newest application releases, and referenced maps; off-host backups follow their separate retention policy. Keep private settings and tunnel credentials intact. Stop the fixed `adsb` Compose project if immediate shutdown is needed; do not stop unrelated containers.
 
 ## Hardware commissioning remains required
 

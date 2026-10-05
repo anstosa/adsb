@@ -54,6 +54,26 @@ class AdminFrontendContractTest(unittest.TestCase):
         self.assertIn("FlightAware assigns", card)
         self.assertIn('id="flightaware-claim"', card)
 
+    # keep source-specific diagnostics and persistent graphs discoverable
+    def test_reception_diagnostics_have_separate_radio_cards(self) -> None:
+        html = (PROJECT_ROOT / "web/admin.html").read_text(encoding="utf-8")
+        script = (PROJECT_ROOT / "web/admin.js").read_text(encoding="utf-8")
+        self.assertIn('id="reception-1090-rate"', html)
+        self.assertIn('id="reception-978-rate"', html)
+        self.assertIn('href="/map/graphs1090/"', html)
+        self.assertIn("Quiet 978 MHz traffic is normal", script)
+        self.assertIn("Its old JSON timestamp is not being presented as recent radio activity", script)
+
+    # expose the weekly review separately from editable station settings
+    def test_maintenance_report_has_a_read_only_card(self) -> None:
+        html = (PROJECT_ROOT / "web/admin.html").read_text(encoding="utf-8")
+        maintenance_start = html.index('class="panel maintenance-panel"')
+        form_start = html.index('id="settings-form"')
+        self.assertLess(maintenance_start, form_start)
+        self.assertIn('id="maintenance-reboot"', html)
+        self.assertIn('id="maintenance-email-notification"', html)
+        self.assertIn("are not performed automatically", html)
+
 
 # provide one live backend per test
 class AdminServerTest(unittest.TestCase):
@@ -179,6 +199,24 @@ class AdminServerTest(unittest.TestCase):
                     "message": "reconciled",
                     "updated_at": updated_at,
                     "hardware": {"connected": connected, "message": "receiver state"},
+                    "reception": {
+                        "1090": {
+                            "hardware_present": True,
+                            "service_running": True,
+                            "telemetry_state": "receiving",
+                            "messages_per_minute": 1200,
+                            "last_activity_at": updated_at,
+                            "sample_at": updated_at,
+                        },
+                        "978": {
+                            "hardware_present": True,
+                            "service_running": True,
+                            "telemetry_state": "quiet",
+                            "messages_per_minute": 0,
+                            "last_activity_at": None,
+                            "sample_at": updated_at,
+                        },
+                    },
                     "networks": {
                         "flightaware": {
                             "enabled": True,
@@ -236,6 +274,67 @@ class AdminServerTest(unittest.TestCase):
         status, _, payload = self.json_request("GET", "/api/admin/status")
         self.assertEqual(401, status)
         self.assertEqual({"error": "authentication_required"}, payload)
+        status, _, payload = self.json_request("GET", "/api/admin/maintenance")
+        self.assertEqual(401, status)
+        self.assertEqual({"error": "authentication_required"}, payload)
+
+    # keep maintenance reports authenticated bounded and uncached
+    def test_maintenance_report_returns_unknown_and_valid_safe_projection(self) -> None:
+        cookie, _ = self.login()
+        status, headers, payload = self.json_request("GET", "/api/admin/maintenance", headers={"Cookie": cookie})
+        self.assertEqual(200, status)
+        self.assertEqual("private, no-store", headers["cache-control"])
+        self.assertEqual("unknown", payload["status"])
+        self.assertEqual([], payload["images"])
+        self.assertEqual("not_configured", payload["email_notifications"]["state"])
+        secret = secrets.token_urlsafe(24)
+        report_path = self.status_path.with_name("maintenance.json")
+        report_path.parent.mkdir(exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "attention",
+                    "reboot_required": True,
+                    "disk_free_percent": 72.5,
+                    "map_status": "current",
+                    "images": [
+                        {
+                            "name": "ultrafeeder",
+                            "review_ref": "ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest",
+                            "status": "review",
+                            "secret": secret,
+                        }
+                    ],
+                    "secret": secret,
+                }
+            ),
+            encoding="utf-8",
+        )
+        status, headers, payload = self.json_request("GET", "/api/admin/maintenance", headers={"Cookie": cookie})
+        self.assertEqual(200, status)
+        self.assertEqual("private, no-store", headers["cache-control"])
+        self.assertEqual("attention", payload["status"])
+        self.assertTrue(payload["reboot_required"])
+        self.assertEqual(72.5, payload["disk_free_percent"])
+        self.assertEqual("review", payload["images"][0]["status"])
+        self.assertNotIn(secret, json.dumps(payload))
+
+    # optional notifier state cannot hide a valid maintenance report
+    def test_maintenance_report_survives_notification_projection_failure(self) -> None:
+        cookie, _ = self.login()
+        with patch.object(self.server.application.alerts, "settings", side_effect=RuntimeError):
+            settings_status, _, settings_payload = self.json_request(
+                "GET", "/api/admin/maintenance", headers={"Cookie": cookie}
+            )
+        self.assertEqual(200, settings_status)
+        self.assertEqual("unknown", settings_payload["email_notifications"]["state"])
+        with patch.object(self.server.application.alerts, "maintenance_email_status", side_effect=RuntimeError):
+            status, headers, payload = self.json_request("GET", "/api/admin/maintenance", headers={"Cookie": cookie})
+        self.assertEqual(200, status)
+        self.assertEqual("private, no-store", headers["cache-control"])
+        self.assertEqual("unknown", payload["status"])
+        self.assertEqual("unknown", payload["email_notifications"]["state"])
 
     # verify login requires exact origin and json
     def test_login_rejects_cross_origin_and_forms(self) -> None:
@@ -650,6 +749,19 @@ class AdminServerTest(unittest.TestCase):
                     "message": "reconciled",
                     "updated_at": updated_at,
                     "hardware": {"connected": True, "message": "receivers online", "serial": secret},
+                    "reception": {
+                        "1090": {
+                            "hardware_present": True,
+                            "service_running": True,
+                            "telemetry_state": "receiving",
+                            "messages_per_minute": 1234.5,
+                            "last_activity_at": updated_at,
+                            "sample_at": updated_at,
+                            "df_counts": [secret],
+                            "raw_payload": secret,
+                        },
+                        "evil": {"raw_payload": secret},
+                    },
                     "networks": {
                         "adsbexchange": {
                             "enabled": True,
@@ -674,6 +786,10 @@ class AdminServerTest(unittest.TestCase):
         self.assertTrue(payload["hardware"]["connected"])
         self.assertEqual("active", payload["networks"]["adsbexchange"]["message"])
         self.assertTrue(payload["networks"]["adsbexchange"]["connected"])
+        self.assertEqual("receiving", payload["reception"]["1090"]["telemetry_state"])
+        self.assertEqual(1234.5, payload["reception"]["1090"]["messages_per_minute"])
+        self.assertNotIn("df_counts", payload["reception"]["1090"])
+        self.assertNotIn("evil", payload["reception"])
         self.assertNotIn(secret, json.dumps(payload))
         self.assertNotIn("unknown", payload["networks"])
 
@@ -699,6 +815,8 @@ class AdminServerTest(unittest.TestCase):
         self.assertTrue(payload["hardware"]["connected"])
         self.assertFalse(payload["networks"]["flightaware"]["running"])
         self.assertTrue(payload["networks"]["flightaware"]["connected"])
+        self.assertEqual(1200, payload["reception"]["1090"]["messages_per_minute"])
+        self.assertEqual("quiet", payload["reception"]["978"]["telemetry_state"])
 
     # verify stale observations retain intent without claiming runtime state
     def test_stale_status_clears_observed_state(self) -> None:
@@ -711,6 +829,9 @@ class AdminServerTest(unittest.TestCase):
         self.assertTrue(payload["networks"]["flightaware"]["enabled"])
         self.assertIsNone(payload["networks"]["flightaware"]["running"])
         self.assertIsNone(payload["networks"]["flightaware"]["connected"])
+        self.assertEqual("unavailable", payload["reception"]["1090"]["telemetry_state"])
+        self.assertIsNone(payload["reception"]["1090"]["messages_per_minute"])
+        self.assertIsNone(payload["reception"]["1090"]["last_activity_at"])
 
     # verify excessive future clock skew is not shown as success
     def test_future_status_clears_observed_state(self) -> None:
@@ -740,6 +861,27 @@ class AdminServerTest(unittest.TestCase):
         self.assertIsNone(payload["hardware"]["connected"])
         self.assertIsNone(payload["networks"]["flightaware"]["connected"])
         self.assertFalse(payload["networks"]["flightaware"]["running"])
+
+    # reject malformed reception metrics without hiding valid source state
+    def test_reception_projection_bounds_metrics_and_timestamps(self) -> None:
+        now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+        self.write_status(now.isoformat().replace("+00:00", "Z"))
+        status = json.loads(self.status_path.read_text(encoding="utf-8"))
+        status["reception"]["1090"].update(
+            {
+                "messages_per_minute": float("inf"),
+                "last_activity_at": "not-a-timestamp",
+                "sample_at": "2026-09-05T12:01:00Z",
+            }
+        )
+        status["reception"]["978"]["telemetry_state"] = "broken"
+        self.status_path.write_text(json.dumps(status), encoding="utf-8")
+        payload = sanitized_status(self.status_path, now=now)
+        self.assertIsNone(payload["reception"]["1090"]["messages_per_minute"])
+        self.assertIsNone(payload["reception"]["1090"]["last_activity_at"])
+        self.assertIsNone(payload["reception"]["1090"]["sample_at"])
+        self.assertEqual("unavailable", payload["reception"]["978"]["telemetry_state"])
+        self.assertIsNone(payload["reception"]["978"]["messages_per_minute"])
 
     # verify a null status document is unknown rather than stopped
     def test_null_status_document_is_unknown(self) -> None:

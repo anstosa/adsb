@@ -1,0 +1,7 @@
+Host adsb-backup
+    HostName REPLACE_WITH_ADSB_HOST
+    User adsb-backup
+    IdentityFile /home/ubuntu/.config/blueberry-backups-adsb/ssh/adsb-backup
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking yes

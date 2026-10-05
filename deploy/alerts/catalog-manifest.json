@@ -1,0 +1,30 @@
+{
+  "catalog_schema_version": 1,
+  "catalog_sha256": "f8540c1b587ef7b300d30506c5f02f937ce7b616a7fa2d3907ea155af442abc8",
+  "category_counts": {
+    "medical": 841,
+    "military": 9854,
+    "news": 4
+  },
+  "derivation": {
+    "identity_filter": "exact six-character hexadecimal ICAO only; malformed upstream identities omitted",
+    "medical": "Category equals Flying Doctors",
+    "military": "#CMPG equals Mil",
+    "news_reviewed_hexes": [
+      "A2CCA7",
+      "A63954",
+      "A7C45A",
+      "ACD27A"
+    ]
+  },
+  "derived_at": "2026-10-05",
+  "entry_count": 10684,
+  "schema_version": 1,
+  "upstream": {
+    "commit": "dc611e2cc1c243f61a6d9d913b83613a19e1f858",
+    "license": "ODbL-1.0 and DBCL-1.0",
+    "name": "sdr-enthusiasts/plane-alert-db",
+    "source": "plane-alert-db.csv",
+    "source_sha256": "6a1ae6d60c61e18d096039dc0eb4de1d87c3bfafc500efb615dbe0b703962915"
+  }
+}

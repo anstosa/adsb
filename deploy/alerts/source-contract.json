@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "marker_schema_version": 1,
+  "source_state_schema_version": 2,
+  "aircraft_json_interval_seconds": 1,
+  "stats_interval_seconds": 10,
+  "sources": {
+    "1090": {
+      "mode": "readsb",
+      "service": "alert-source-1090",
+      "input_service": "airspy",
+      "input_port": 30005,
+      "protocol": "beast_in",
+      "directory": "1090"
+    },
+    "978": {
+      "mode": "readsb",
+      "service": "alert-source-978fallback",
+      "input_service": "dump978",
+      "input_port": 30978,
+      "protocol": "uat_in",
+      "directory": "978"
+    }
+  }
+}

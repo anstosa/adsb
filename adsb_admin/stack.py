@@ -18,10 +18,13 @@ DOCKER = "/usr/bin/docker"
 COMPOSE_PATH = "/var/lib/adsb/runtime/compose.json"
 RUNTIME_PATH = Path("/etc/adsb/runtime.json")
 STATUS_PATH = Path("/var/lib/adsb/status/status.json")
-UNITS = ("adsb-controller.service", "adsb-admin.service")
+WORKER_STATUS_PATH = Path("/var/lib/adsb/alerts/worker-status.json")
+UNITS = ("adsb-alerts.service", "adsb-controller.service", "adsb-admin.service")
 CORE_SERVICES = frozenset({"ultrafeeder", "proxy"})
-KNOWN_SERVICES = CORE_SERVICES | {"cloudflared", "airspy", "dump978", "piaware"}
+SOURCE_SERVICES = frozenset({"alert-source-1090", "alert-source-978fallback"})
+KNOWN_SERVICES = CORE_SERVICES | SOURCE_SERVICES | {"cloudflared", "airspy", "dump978", "piaware"}
 ACTIVATION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+CONTRACT_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 START_TIMEOUT_SECONDS = 90
 POLL_SECONDS = 2
 COMMAND_ENV = {
@@ -245,6 +248,109 @@ def controller_phase(*, now=None, expected_activation=None):
     return status["phase"]
 
 
+# calculate a bounded UTC age from one explicit timestamp
+def timestamp_age(value, *, now=None):
+    try:
+        # accept worker epoch seconds or controller ISO timestamps
+        if type(value) in (int, float):
+            parsed = datetime.fromtimestamp(value, timezone.utc)
+        elif isinstance(value, str):
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        else:
+            return None
+        current = now or datetime.now(timezone.utc)
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    # require timezone-aware values at the trust boundary
+    if parsed.tzinfo is None or current.tzinfo is None:
+        return None
+    return (current - parsed.astimezone(timezone.utc)).total_seconds()
+
+
+# verify notifier liveness and the selected physical source generations
+def alert_infrastructure(*, now=None, deadline=None):
+    worker_unit = unit_state("adsb-alerts.service", deadline=deadline)
+    result = {
+        "infrastructure_ready": False,
+        "unit": worker_unit,
+        "worker": "unhealthy",
+        "sources": "unhealthy",
+    }
+    try:
+        status = read_json(STATUS_PATH)
+        worker = read_json(WORKER_STATUS_PATH)
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError, RecursionError):
+        return result
+    activation_id = status.get("activation_id") if isinstance(status, dict) else None
+    alerts = status.get("alerts") if isinstance(status, dict) else None
+    # require current fixed controller provenance and a bounded source projection
+    if (
+        not isinstance(activation_id, str)
+        or not ACTIVATION_PATTERN.fullmatch(activation_id)
+        or not isinstance(alerts, dict)
+        or alerts.get("activation_id") != activation_id
+        or not isinstance(alerts.get("source_contract_digest"), str)
+        or not CONTRACT_DIGEST_PATTERN.fullmatch(alerts["source_contract_digest"])
+        or not isinstance(alerts.get("expected_bands"), list)
+        or not isinstance(alerts.get("sources"), dict)
+    ):
+        return result
+    expected_bands = alerts["expected_bands"]
+    # reject duplicate or invented physical bands
+    if any(type(band) is not str or band not in {"1090", "978"} for band in expected_bands) or len(
+        expected_bands
+    ) != len(set(expected_bands)):
+        return result
+    # require a current worker bound to this activation and source contract
+    if (
+        not isinstance(worker, dict)
+        or worker.get("schema_version") != 1
+        or worker.get("activation_id") != activation_id
+        or worker.get("source_contract_digest") != alerts["source_contract_digest"]
+        or worker.get("process_running") is not True
+        or not isinstance(worker.get("bands"), dict)
+    ):
+        return result
+    worker_age = timestamp_age(worker.get("sampled_at"), now=now)
+    worker_ready = worker_unit == "active" and worker_age is not None and 0 <= worker_age <= 30
+    result["worker"] = "healthy" if worker_ready else "unhealthy"
+    sources_ready = set(alerts["sources"]) == set(expected_bands)
+    # require each selected band to expose one current matched process generation
+    for band in expected_bands:
+        source = alerts["sources"].get(band)
+        consumed = worker["bands"].get(band)
+        if not isinstance(source, dict) or source.get("state") != "ready":
+            sources_ready = False
+            continue
+        generation = source.get("generation")
+        # require the worker to consume this exact healthy source generation
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or not isinstance(consumed, dict)
+            or consumed.get("state") != "healthy"
+            or consumed.get("generation") != generation
+        ):
+            sources_ready = False
+            continue
+        # readsb sources must also prove the current process, connector and freshness
+        if source.get("mode") == "readsb":
+            source_age = timestamp_age(source.get("sampled_at"), now=now)
+            if (
+                source.get("process_running") is not True
+                or source.get("input_connected") is not True
+                or source_age is None
+                or not 0 <= source_age <= 30
+            ):
+                sources_ready = False
+        # reject any source mode outside the release contract
+        elif source.get("mode") != "native-dump978":
+            sources_ready = False
+    result["sources"] = "healthy" if sources_ready else "unhealthy"
+    result["infrastructure_ready"] = worker_ready and sources_ready
+    return result
+
+
 # gather the fixed nonsecret production readiness projection
 def collect_status(*, now=None, deadline=None):
     admin = unit_state("adsb-admin.service", deadline=deadline)
@@ -253,12 +359,14 @@ def collect_status(*, now=None, deadline=None):
     declared, declaration_ok = declared_services()
     tunnel = tunnel_enabled()
     tunnel_consistent = tunnel is not None and (("cloudflared" in declared) == tunnel)
+    core_declared = declared - SOURCE_SERVICES
+    core_observed = {name: healthy for name, healthy in services.items() if name not in SOURCE_SERVICES}
     containers_ok = (
         compose_ok
         and declaration_ok
         and tunnel_consistent
-        and set(services) == declared
-        and all(services.get(name, False) for name in declared)
+        and set(core_observed) == core_declared
+        and all(core_observed.get(name, False) for name in core_declared)
     )
     origin_ok = http_healthy("http://127.0.0.1:8080/healthz", deadline=deadline) and http_healthy(
         "http://127.0.0.1:8080/map/", deadline=deadline
@@ -279,8 +387,10 @@ def collect_status(*, now=None, deadline=None):
         and phase in {"ready", "waiting"}
         and tunnel_state in {"disabled", "healthy"}
     )
+    alerts = alert_infrastructure(now=now, deadline=deadline)
     return {
         "state": "running" if running else "stopped",
+        "alerts": alerts,
         "checks": {
             "admin": admin,
             "containers": "healthy" if containers_ok else "unhealthy",
@@ -303,7 +413,9 @@ def action_result(action, success, status, reason=None):
 
 # start the supervised units and wait for bounded full readiness
 def start_stack(*, action="start", timeout=START_TIMEOUT_SECONDS):
-    result = run_command([SYSTEMCTL, "start", "adsb-admin.service", "adsb-controller.service"], timeout=30)
+    result = run_command(
+        [SYSTEMCTL, "start", "adsb-admin.service", "adsb-controller.service", "adsb-alerts.service"], timeout=30
+    )
     # refuse readiness when systemd did not accept the fixed start request
     if result is None or result.returncode != 0:
         return action_result(action, False, collect_status(), "systemd start failed")
@@ -314,7 +426,7 @@ def start_stack(*, action="start", timeout=START_TIMEOUT_SECONDS):
     for _attempt in range(maximum_attempts):
         status = collect_status(deadline=deadline)
         # finish as soon as every readiness check passes
-        if status["state"] == "running":
+        if status["state"] == "running" and status.get("alerts", {}).get("infrastructure_ready") is True:
             return action_result(action, True, status)
         remaining = deadline - time.monotonic()
         # never claim success after the bounded deadline
@@ -333,6 +445,7 @@ def stopped_status():
     return confirmed, {
         "state": "stopped",
         "checks": {
+            "alerts": unit_states["adsb-alerts.service"],
             "admin": unit_states["adsb-admin.service"],
             "containers": "stopped" if compose_ok and not services else "unconfirmed",
             "controller": unit_states["adsb-controller.service"],
@@ -343,6 +456,7 @@ def stopped_status():
 # stop supervisors first and then only the fixed compose project
 def stop_stack(*, action="stop"):
     commands = [
+        [SYSTEMCTL, "stop", "adsb-alerts.service"],
         [SYSTEMCTL, "stop", "adsb-controller.service"],
         [SYSTEMCTL, "stop", "adsb-admin.service"],
         [DOCKER, "compose", "-p", "adsb", "-f", COMPOSE_PATH, "down", "--remove-orphans", "--timeout", "10"],

@@ -109,6 +109,61 @@ class StackControlTests(unittest.TestCase):
         self.assertEqual("waiting", result["checks"]["controller_status"])
         self.assertEqual("disabled", result["checks"]["tunnel"])
 
+    # keep auxiliary notifier degradation out of the routine core status signal
+    def test_alert_source_failure_does_not_change_core_status_exit(self):
+        observed = {
+            "ultrafeeder": True,
+            "proxy": True,
+            "airspy": True,
+            "alert-source-1090": False,
+        }
+        declared = {"ultrafeeder", "proxy", "airspy", "alert-source-1090"}
+        with mock.patch("adsb_admin.stack.unit_state", return_value="active"):
+            with mock.patch("adsb_admin.stack.compose_services", return_value=(observed, True)):
+                with mock.patch("adsb_admin.stack.declared_services", return_value=(declared, True)):
+                    with mock.patch("adsb_admin.stack.tunnel_enabled", return_value=False):
+                        with mock.patch("adsb_admin.stack.http_healthy", return_value=True):
+                            with mock.patch("adsb_admin.stack.controller_phase", return_value="ready"):
+                                with mock.patch(
+                                    "adsb_admin.stack.alert_infrastructure",
+                                    return_value={"infrastructure_ready": False},
+                                ):
+                                    result = stack.collect_status()
+        self.assertEqual("running", result["state"])
+        self.assertFalse(result["alerts"]["infrastructure_ready"])
+
+    # nested auxiliary json must not crash the core-only routine status signal
+    def test_nested_worker_status_is_degraded_with_core_exit_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status.json"
+            worker = root / "worker-status.json"
+            status.write_text(json.dumps({"phase": "ready"}))
+            worker.write_text("[" * 1500 + "0" + "]" * 1500)
+            output = io.StringIO()
+            with contextlib.ExitStack() as patches:
+                patches.enter_context(mock.patch("adsb_admin.stack.STATUS_PATH", str(status)))
+                patches.enter_context(mock.patch("adsb_admin.stack.WORKER_STATUS_PATH", str(worker)))
+                patches.enter_context(mock.patch("adsb_admin.stack.os.geteuid", return_value=0))
+                patches.enter_context(mock.patch("adsb_admin.stack.unit_state", return_value="active"))
+                patches.enter_context(
+                    mock.patch(
+                        "adsb_admin.stack.compose_services", return_value=({"ultrafeeder": True, "proxy": True}, True)
+                    )
+                )
+                patches.enter_context(
+                    mock.patch("adsb_admin.stack.declared_services", return_value=({"ultrafeeder", "proxy"}, True))
+                )
+                patches.enter_context(mock.patch("adsb_admin.stack.tunnel_enabled", return_value=False))
+                patches.enter_context(mock.patch("adsb_admin.stack.http_healthy", return_value=True))
+                patches.enter_context(mock.patch("adsb_admin.stack.controller_phase", return_value="ready"))
+                patches.enter_context(contextlib.redirect_stdout(output))
+                code = stack.main(["adsb-stack", "status"])
+        result = json.loads(output.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual("running", result["state"])
+        self.assertFalse(result["alerts"]["infrastructure_ready"])
+
     # require the optional connector container and local readiness endpoint
     def test_enabled_tunnel_must_be_running_and_ready(self):
         calls = []
@@ -249,12 +304,139 @@ class StackControlTests(unittest.TestCase):
             with mock.patch.object(stack, "STATUS_PATH", path):
                 self.assertEqual("unhealthy", stack.controller_phase(now=now, expected_activation="b" * 32))
 
+    # require fresh matching worker and source generations for activation readiness
+    def test_alert_infrastructure_requires_current_worker_and_sources(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / "status.json"
+            worker_path = root / "worker-status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "activation_id": "a" * 32,
+                        "alerts": {
+                            "activation_id": "a" * 32,
+                            "source_contract_digest": "b" * 64,
+                            "expected_bands": ["1090"],
+                            "sources": {
+                                "1090": {
+                                    "mode": "readsb",
+                                    "service": "alert-source-1090",
+                                    "state": "ready",
+                                    "generation": "2de11047-d307-4cce-a43c-4b02958e77c4",
+                                    "sampled_at": now.isoformat(),
+                                    "process_running": True,
+                                    "input_connected": True,
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            worker_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "activation_id": "a" * 32,
+                        "source_contract_digest": "b" * 64,
+                        "sampled_at": now.timestamp(),
+                        "process_running": True,
+                        "bands": {
+                            "1090": {
+                                "state": "healthy",
+                                "generation": "2de11047-d307-4cce-a43c-4b02958e77c4",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(stack, "STATUS_PATH", status_path):
+                with mock.patch.object(stack, "WORKER_STATUS_PATH", worker_path):
+                    with mock.patch("adsb_admin.stack.unit_state", return_value="active"):
+                        result = stack.alert_infrastructure(now=now)
+        self.assertTrue(result["infrastructure_ready"])
+        self.assertEqual("healthy", result["sources"])
+
+    # reject worker-unknown and mismatched generations without changing core readiness
+    def test_worker_must_consume_the_current_source_generation(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        generation = "2de11047-d307-4cce-a43c-4b02958e77c4"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / "status.json"
+            worker_path = root / "worker-status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "activation_id": "a" * 32,
+                        "alerts": {
+                            "activation_id": "a" * 32,
+                            "source_contract_digest": "b" * 64,
+                            "expected_bands": ["1090"],
+                            "sources": {
+                                "1090": {
+                                    "mode": "readsb",
+                                    "service": "alert-source-1090",
+                                    "state": "ready",
+                                    "generation": generation,
+                                    "sampled_at": now.isoformat(),
+                                    "process_running": True,
+                                    "input_connected": True,
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            worker = {
+                "schema_version": 1,
+                "activation_id": "a" * 32,
+                "source_contract_digest": "b" * 64,
+                "sampled_at": now.timestamp(),
+                "process_running": True,
+                "bands": {"1090": {"state": "unknown", "generation": generation}},
+            }
+            with mock.patch.object(stack, "STATUS_PATH", status_path):
+                with mock.patch.object(stack, "WORKER_STATUS_PATH", worker_path):
+                    with mock.patch("adsb_admin.stack.unit_state", return_value="active"):
+                        # reject a heartbeat that has not consumed a healthy source
+                        worker_path.write_text(json.dumps(worker), encoding="utf-8")
+                        unknown = stack.alert_infrastructure(now=now)
+                        # reject a healthy claim for a prior source generation
+                        worker["bands"]["1090"] = {"state": "healthy", "generation": "stale-generation"}
+                        worker_path.write_text(json.dumps(worker), encoding="utf-8")
+                        mismatch = stack.alert_infrastructure(now=now)
+        self.assertFalse(unknown["infrastructure_ready"])
+        self.assertFalse(mismatch["infrastructure_ready"])
+        # routine status remains independently governed by the core predicate
+        with mock.patch("adsb_admin.stack.unit_state", return_value="active"):
+            with mock.patch(
+                "adsb_admin.stack.compose_services",
+                return_value=({"ultrafeeder": True, "proxy": True, "alert-source-1090": True}, True),
+            ):
+                with mock.patch(
+                    "adsb_admin.stack.declared_services",
+                    return_value=({"ultrafeeder", "proxy", "alert-source-1090"}, True),
+                ):
+                    with mock.patch("adsb_admin.stack.tunnel_enabled", return_value=False):
+                        with mock.patch("adsb_admin.stack.http_healthy", return_value=True):
+                            with mock.patch("adsb_admin.stack.controller_phase", return_value="ready"):
+                                with mock.patch("adsb_admin.stack.alert_infrastructure", return_value=mismatch):
+                                    core = stack.collect_status()
+        self.assertEqual("running", core["state"])
+
     # attempt both unit stops and scoped Compose teardown after a failure
     def test_failed_shutdown_attempts_all_steps_and_returns_failure(self):
         results = [
             process(returncode=1),
             process(),
             process(),
+            process(),
+            process(returncode=3, stdout="inactive\n"),
             process(returncode=3, stdout="inactive\n"),
             process(returncode=3, stdout="inactive\n"),
             process(stdout=""),
@@ -262,8 +444,9 @@ class StackControlTests(unittest.TestCase):
         with mock.patch("adsb_admin.stack.run_command", side_effect=results) as run:
             result = stack.stop_stack()
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual([stack.SYSTEMCTL, "stop", "adsb-controller.service"], commands[0])
-        self.assertEqual([stack.SYSTEMCTL, "stop", "adsb-admin.service"], commands[1])
+        self.assertEqual([stack.SYSTEMCTL, "stop", "adsb-alerts.service"], commands[0])
+        self.assertEqual([stack.SYSTEMCTL, "stop", "adsb-controller.service"], commands[1])
+        self.assertEqual([stack.SYSTEMCTL, "stop", "adsb-admin.service"], commands[2])
         self.assertEqual(
             [
                 stack.DOCKER,
@@ -277,7 +460,7 @@ class StackControlTests(unittest.TestCase):
                 "--timeout",
                 "10",
             ],
-            commands[2],
+            commands[3],
         )
         self.assertEqual("failed", result["result"])
 
@@ -287,6 +470,8 @@ class StackControlTests(unittest.TestCase):
             process(),
             process(),
             process(),
+            process(),
+            process(returncode=3, stdout="inactive\n"),
             process(returncode=3, stdout="inactive\n"),
             process(returncode=3, stdout="inactive\n"),
             process(stdout=""),
@@ -302,7 +487,9 @@ class StackControlTests(unittest.TestCase):
             process(),
             process(),
             process(),
+            process(),
             None,
+            process(returncode=3, stdout="inactive\n"),
             process(returncode=3, stdout="inactive\n"),
             process(stdout=""),
         ]
@@ -322,6 +509,18 @@ class StackControlTests(unittest.TestCase):
         self.assertEqual("readiness timed out", result["reason"])
         self.assertEqual(2, status.call_count)
         sleep.assert_called_once_with(1)
+
+    # require notifier infrastructure during start without changing routine status semantics
+    def test_start_waits_for_alert_infrastructure(self):
+        core_only = {"state": "running", "checks": {}, "alerts": {"infrastructure_ready": False}}
+        complete = {"state": "running", "checks": {}, "alerts": {"infrastructure_ready": True}}
+        with mock.patch("adsb_admin.stack.run_command", return_value=process()) as run:
+            with mock.patch("adsb_admin.stack.collect_status", side_effect=[core_only, complete]):
+                with mock.patch("adsb_admin.stack.time.monotonic", side_effect=[0, 0, 1]):
+                    with mock.patch("adsb_admin.stack.time.sleep"):
+                        result = stack.start_stack(timeout=2)
+        self.assertEqual("ok", result["result"])
+        self.assertIn("adsb-alerts.service", run.call_args.args[0])
 
     # skip subprocesses and sockets after the outer readiness deadline
     def test_expired_readiness_deadline_skips_blocking_operations(self):

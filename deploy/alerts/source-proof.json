@@ -1,0 +1,191 @@
+{
+  "dump978_image": "ghcr.io/sdr-enthusiasts/docker-dump978@sha256:84959fa5e7476d210c533b578954cd8e49db5d3944602eef8e40f80ee8af44b2",
+  "generated_at": "2026-10-05T20:21:11Z",
+  "health_sha256": "29e0b9b1e6bc96b3a7512b1ca5f3e2975190fb0605c17fe2e06ce6ebde15c3c8",
+  "image": "ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder@sha256:fbf81742db245886ceb9c782fb6a707bc6c90b6822d91a1a094b370722e27484",
+  "native978": {
+    "existing_host_http_endpoint": "http://127.0.0.1:8978/skyaware978/data/aircraft.json",
+    "failure_code": "independent_producer_coverage_unavailable",
+    "identity_contract_passed": true,
+    "native_http_host_port": 8978,
+    "native_json_container_port": 30979,
+    "native_json_tcp_host_port_published": false,
+    "new_host_ports_allowed": false,
+    "producer_coverage_contract_passed": false,
+    "proof": {
+      "capabilities": "none",
+      "first_tracked_message": 2,
+      "json_keys": [
+        "aircraft",
+        "messages",
+        "now"
+      ],
+      "messages_stable_while_input_stalled": true,
+      "network": "none",
+      "no_position": true,
+      "producer_coverage_fields_present": false,
+      "readonly_root": true,
+      "rss_kib": 5080,
+      "skyaware978_sha256": "abee1f68d448e58f395a8c27e84eba5cb0be7dfb63a93899bc4d31b02753efd1",
+      "tisb_icao_retained": true,
+      "unsupported_counter_progress": true,
+      "writer_fresh_while_input_stalled": true
+    },
+    "selected": false
+  },
+  "production_headroom": {
+    "captured_at": "2026-10-05T20:19:37Z",
+    "headroom_passed": true,
+    "mem_available_kib_samples": [
+      1116760,
+      1135172,
+      1118816,
+      1144472,
+      1104012
+    ],
+    "minimum_mem_available_kib": 1104012,
+    "minimum_residual_requirement_kib": 262144,
+    "oom_events_last_24h": 0,
+    "planned_incremental_memory_kib": 229376,
+    "residual_after_planned_increment_kib": 874636,
+    "vmstat_swap_in_kib_per_second": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "vmstat_swap_out_kib_per_second": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "production_headroom_transient_audit": {
+    "captured_at": "2026-10-05T19:05:55Z",
+    "headroom_passed": false,
+    "mem_available_kib_samples": [
+      1026996,
+      1056400,
+      1100928,
+      1091848,
+      1070364
+    ],
+    "minimum_mem_available_kib": 1026996,
+    "minimum_residual_requirement_kib": 262144,
+    "oom_events_last_24h": 0,
+    "planned_incremental_memory_kib": 229376,
+    "residual_after_planned_increment_kib": 797620,
+    "vmstat_swap_in_kib_per_second": [
+      0,
+      0,
+      0,
+      0,
+      4
+    ],
+    "vmstat_swap_out_kib_per_second": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "schema_version": 1,
+  "sources": [
+    {
+      "accepted": [
+        5005,
+        0
+      ],
+      "alternative_aircraft_ingress": false,
+      "band": "1090",
+      "capabilities": "none",
+      "empty_output_directory_at_start": true,
+      "first_tracked_message": 2,
+      "fresh_generation_marker": true,
+      "healthcheck_invocations": 2,
+      "healthcheck_max_runtime_ms": 152,
+      "healthcheck_timeout_seconds": 5,
+      "kernel_bytes_progress": true,
+      "kernel_socket_stable": true,
+      "network": "none",
+      "no_position": true,
+      "readonly_root": true,
+      "readsb_listening_tcp_ports": [],
+      "rss_kib": 4944,
+      "source_state_schema": 2,
+      "startup_accepted": [
+        0,
+        0
+      ],
+      "startup_statistics_wait_seconds": 12,
+      "state_mode": "0o640",
+      "tisb_icao_retained": null,
+      "unsupported_counter_progress": true
+    },
+    {
+      "accepted": [
+        5008,
+        0
+      ],
+      "alternative_aircraft_ingress": false,
+      "band": "978",
+      "capabilities": "none",
+      "empty_output_directory_at_start": true,
+      "first_tracked_message": 3,
+      "fresh_generation_marker": true,
+      "healthcheck_invocations": 2,
+      "healthcheck_max_runtime_ms": 125,
+      "healthcheck_timeout_seconds": 5,
+      "kernel_bytes_progress": true,
+      "kernel_socket_stable": true,
+      "network": "none",
+      "no_position": true,
+      "readonly_root": true,
+      "readsb_listening_tcp_ports": [],
+      "rss_kib": 5064,
+      "source_state_schema": 2,
+      "startup_accepted": [
+        0,
+        0
+      ],
+      "startup_statistics_wait_seconds": 12,
+      "state_mode": "0o640",
+      "tisb_icao_retained": true,
+      "unsupported_counter_progress": true
+    }
+  ],
+  "worker": {
+    "capabilities": "none",
+    "capacity_error": "state_capacity_exceeded",
+    "catalog_entries": 10684,
+    "cgroup_current_kib": 60108,
+    "channels": [
+      "email",
+      "pushover"
+    ],
+    "continuity_complete": true,
+    "encounters": 10000,
+    "maintenance_body_bytes": 8192,
+    "maintenance_cap_rejected": true,
+    "maintenance_channel": "email",
+    "maintenance_notification_cap": 1000,
+    "maintenance_notifications": 1000,
+    "maintenance_pending": 1000,
+    "max_encounters": 10000,
+    "memory_limit_bytes": 100663296,
+    "network": "none",
+    "normalized_source_rows": 20000,
+    "peak_rss_kib": 74876,
+    "pending_event_cap": 1000,
+    "pending_events": 1000,
+    "pending_jobs": 2000,
+    "per_band_source_rows": 10000,
+    "provider_dispatches": 0,
+    "readonly_root": true,
+    "rss_kib": 57692
+  }
+}

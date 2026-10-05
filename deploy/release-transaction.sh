@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # restore host integration after a failed release activation
 
+# keep maintenance host files in the same activation transaction as the application
+MAINTENANCE_ARTIFACTS=(
+    '/etc/systemd/system/adsb-maintenance.service|adsb-maintenance.service'
+    '/etc/systemd/system/adsb-maintenance.timer|adsb-maintenance.timer'
+    '/etc/systemd/system/apt-daily.timer.d/adsb-weekly.conf|apt-daily-weekly.conf'
+    '/etc/systemd/system/apt-daily-upgrade.timer.d/adsb-weekly.conf|apt-upgrade-weekly.conf'
+    '/etc/apt/apt.conf.d/52unattended-upgrades-adsb|52unattended-upgrades-adsb'
+)
+
 # preserve one host file or record its prior absence
 backup_activation_file() {
     local rollback_dir=$1
@@ -36,6 +45,11 @@ backup_activation_files() {
     backup_activation_file "$rollback_dir" "$root/etc/sudoers.d/adsb-stack" sudoers
     backup_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-admin.service" adsb-admin.service
     backup_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-controller.service" adsb-controller.service
+    backup_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-alerts.service" adsb-alerts.service
+    # retain every weekly scheduling and update-policy file
+    for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
+        backup_activation_file "$rollback_dir" "$root${artifact%%|*}" "${artifact##*|}"
+    done
 }
 
 # restore pointers and host files after post-staging failure
@@ -71,5 +85,10 @@ rollback_activation() {
     restore_activation_file "$rollback_dir" "$root/etc/sudoers.d/adsb-stack" sudoers
     restore_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-admin.service" adsb-admin.service
     restore_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-controller.service" adsb-controller.service
+    restore_activation_file "$rollback_dir" "$root/etc/systemd/system/adsb-alerts.service" adsb-alerts.service
+    # restore prior timer schedules and security policy before reloading units
+    for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
+        restore_activation_file "$rollback_dir" "$root${artifact%%|*}" "${artifact##*|}"
+    done
     rm -rf -- "$app_release" "$map_release"
 }

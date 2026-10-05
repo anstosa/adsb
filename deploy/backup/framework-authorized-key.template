@@ -1,0 +1,1 @@
+restrict,command="/usr/local/bin/adsb-backup-ssh-dispatch" ssh-ed25519 REPLACE_WITH_FRAMEWORK_BACKUP_PUBLIC_KEY framework-adsb-backup

@@ -1,0 +1,1 @@
+adsb-backup ALL=(root) NOPASSWD: /usr/local/sbin/adsb-backup-remote-ops backup-proof, /usr/local/sbin/adsb-backup-remote-ops backup-stream

@@ -18,9 +18,12 @@ NETWORK_NAMES = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
 STATION_KEYS = frozenset(("name", "latitude", "longitude", "altitude_m"))
 PUBLIC_NETWORK_KEYS = frozenset(("enabled", "mlat", "feeder_id", "feeder_id_configured"))
 STATUS_PHASES = frozenset(("starting", "ready", "error", "waiting"))
+RECEPTION_BANDS = ("1090", "978")
+RECEPTION_STATES = frozenset(("absent", "stopped", "unavailable", "stale", "monitoring", "quiet", "receiving"))
 STATION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 REQUIRED_FEEDER_IDS = frozenset(("adsbexchange", "adsblol"))
 STATUS_FRESHNESS_SECONDS = 30
+MAX_MESSAGES_PER_MINUTE = 10_000_000
 UNKNOWN_STATUS_MESSAGE = "controller status stale or unknown"
 FLIGHTAWARE_CLAIM_URL_PATTERN = re.compile(
     r"^https://www\.flightaware\.com/adsb/piaware/claim/"
@@ -317,6 +320,21 @@ class SettingsStore:
             return redact_settings(self._settings)
 
 
+# build safe unknown reception state
+def _unknown_reception() -> dict[str, Any]:
+    return {
+        band: {
+            "hardware_present": None,
+            "service_running": None,
+            "telemetry_state": "unavailable",
+            "messages_per_minute": None,
+            "last_activity_at": None,
+            "sample_at": None,
+        }
+        for band in RECEPTION_BANDS
+    }
+
+
 # build a safe unknown controller state
 def _unknown_status() -> dict[str, Any]:
     return {
@@ -326,6 +344,7 @@ def _unknown_status() -> dict[str, Any]:
         "networks": {},
         "updated_at": "",
         "hardware": {"connected": None, "message": UNKNOWN_STATUS_MESSAGE},
+        "reception": _unknown_reception(),
     }
 
 
@@ -346,6 +365,66 @@ def _fresh_status_timestamp(value: Any, now: datetime) -> tuple[bool, str]:
     if age_seconds > STATUS_FRESHNESS_SECONDS or age_seconds < -STATUS_FRESHNESS_SECONDS:
         return False, value
     return True, value
+
+
+# validate one historical utc observation timestamp
+def _observation_timestamp(value: Any, now: datetime) -> str | None:
+    # reject absent or oversized timestamp text
+    if not isinstance(value, str) or not value or len(value) > 100:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # require an explicit utc timestamp
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    # reject activity claims beyond bounded clock skew
+    if (parsed - now).total_seconds() > STATUS_FRESHNESS_SECONDS:
+        return None
+    return value
+
+
+# project fixed reception fields from private controller status
+def _project_reception(value: Any, now: datetime) -> dict[str, Any]:
+    result = _unknown_reception()
+    # retain the unknown shape for malformed collections
+    if not isinstance(value, dict):
+        return result
+    # sanitize each supported radio band
+    for band in RECEPTION_BANDS:
+        source = value.get(band)
+        # ignore missing or malformed source records
+        if not isinstance(source, dict):
+            continue
+        projected = result[band]
+        hardware_present = source.get("hardware_present")
+        # preserve only explicit hardware presence
+        if isinstance(hardware_present, bool):
+            projected["hardware_present"] = hardware_present
+        service_running = source.get("service_running")
+        # preserve only explicit process state
+        if isinstance(service_running, bool):
+            projected["service_running"] = service_running
+        telemetry_state = source.get("telemetry_state")
+        # preserve only fixed telemetry classifications
+        if telemetry_state in RECEPTION_STATES:
+            projected["telemetry_state"] = telemetry_state
+        rate = source.get("messages_per_minute")
+        # accept only finite bounded rates
+        if (
+            not isinstance(rate, bool)
+            and isinstance(rate, (int, float))
+            and math.isfinite(rate)
+            and 0 <= rate <= MAX_MESSAGES_PER_MINUTE
+        ):
+            projected["messages_per_minute"] = rate
+        projected["last_activity_at"] = _observation_timestamp(source.get("last_activity_at"), now)
+        projected["sample_at"] = _observation_timestamp(source.get("sample_at"), now)
+        # clear rate claims from noncurrent source states
+        if projected["telemetry_state"] in ("absent", "stopped", "unavailable", "stale", "monitoring"):
+            projected["messages_per_minute"] = None
+    return result
 
 
 # expose a strict status projection without arbitrary fields
@@ -385,6 +464,7 @@ def sanitized_status(path: Path, *, now: datetime | None = None) -> dict[str, An
         "networks": {},
         "updated_at": updated_at,
         "hardware": {"connected": None, "message": ""},
+        "reception": _project_reception(raw.get("reception"), current_time),
     }
     hardware = raw.get("hardware")
     # project the bounded hardware state
@@ -442,6 +522,7 @@ def sanitized_status(path: Path, *, now: datetime | None = None) -> dict[str, An
         result["phase"] = "error"
         result["message"] = UNKNOWN_STATUS_MESSAGE
         result["hardware"] = {"connected": None, "message": UNKNOWN_STATUS_MESSAGE}
+        result["reception"] = _unknown_reception()
         # retain only requested intent while clearing observed state
         for network in result["networks"].values():
             network["running"] = None

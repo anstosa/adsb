@@ -1,6 +1,8 @@
 """Regression checks for the privileged deployment boundary."""
 
+import contextlib
 import copy
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -9,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from adsb_admin.controller import (
+    alert_status_for,
     compose_for,
     detect_hardware,
     flightaware_claim_url,
@@ -22,6 +25,7 @@ from adsb_admin.controller import (
     stop_uploaders,
     tcp_connected,
     validate_settings,
+    validate_source_proof,
 )
 
 
@@ -39,6 +43,7 @@ class ControllerTests(unittest.TestCase):
         }
         self.runtime = {
             "source_dir": "/opt/adsb",
+            "resolved_source_dir": "/opt/adsb/releases/test",
             "data_dir": "/var/lib/adsb",
             "activation_id": "a" * 32,
             "tunnel_enabled": False,
@@ -46,9 +51,96 @@ class ControllerTests(unittest.TestCase):
                 name: "example/image@sha256:" + "a" * 64
                 for name in ("ultrafeeder", "piaware", "airspy", "dump978", "proxy", "cloudflared")
             },
+            "source_contract_digest": "b" * 64,
+            "source_contract": {
+                "schema_version": 1,
+                "marker_schema_version": 1,
+                "source_state_schema_version": 2,
+                "aircraft_json_interval_seconds": 1,
+                "stats_interval_seconds": 10,
+                "sources": {
+                    "1090": {
+                        "mode": "readsb",
+                        "service": "alert-source-1090",
+                        "input_service": "airspy",
+                        "input_port": 30005,
+                        "protocol": "beast_in",
+                        "directory": "1090",
+                    },
+                    "978": {
+                        "mode": "readsb",
+                        "service": "alert-source-978fallback",
+                        "input_service": "dump978",
+                        "input_port": 30978,
+                        "protocol": "uat_in",
+                        "directory": "978",
+                    },
+                },
+            },
         }
         self.absent = {"airspy": False, "uat": False}
         self.present = {"airspy": True, "uat": True}
+
+    # publish a consistent immutable proof fixture without running containers
+    def write_source_proof(self, root):
+        value = json.loads((Path(__file__).parents[1] / "deploy/alerts/source-proof.json").read_text())
+        value["image"] = self.runtime["images"]["ultrafeeder"]
+        value["dump978_image"] = self.runtime["images"]["dump978"]
+        value["health_sha256"] = hashlib.sha256((root / "deploy/alerts/source-health.sh").read_bytes()).hexdigest()
+        value["native978"]["existing_host_http_endpoint"] = "http://127.0.0.1:8978/skyaware978/data/aircraft.json"
+        (root / "deploy/alerts/catalog-manifest.json").write_text(
+            json.dumps({"entry_count": value["worker"]["catalog_entries"]})
+        )
+        (root / "deploy/alerts/source-proof.json").write_text(json.dumps(value))
+
+    # reject every omitted or contradicted mandatory g0 evidence section
+    def test_source_proof_requires_successful_measured_gate_sections(self):
+        root = Path(__file__).parents[1]
+        proof = json.loads((root / "deploy/alerts/source-proof.json").read_text())
+        images = json.loads((root / "deploy/images.json").read_text())
+        health = (root / "deploy/alerts/source-health.sh").read_bytes()
+        proof["native978"]["existing_host_http_endpoint"] = "http://127.0.0.1:8978/skyaware978/data/aircraft.json"
+        validate_source_proof(proof, images, health, 10684)
+        failures = [
+            ("sources", None),
+            ("native978", None),
+            ("worker", None),
+            ("production_headroom", None),
+            ("dump978_image", "wrong-image"),
+            ("sources", proof["sources"][:1]),
+        ]
+        # refuse omitted or partial aggregate sections
+        for key, value in failures:
+            invalid = copy.deepcopy(proof)
+            invalid[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_source_proof(invalid, images, health, 10684)
+        nested_failures = [
+            ("worker", "continuity_complete", False),
+            ("worker", "provider_dispatches", 1),
+            ("worker", "peak_rss_kib", 98304),
+            ("worker", "pending_jobs", 1999),
+            ("worker", "maintenance_notification_cap", 999),
+            ("worker", "maintenance_notifications", 999),
+            ("worker", "maintenance_pending", 999),
+            ("worker", "maintenance_body_bytes", 8191),
+            ("worker", "maintenance_channel", "pushover"),
+            ("worker", "maintenance_cap_rejected", False),
+            ("production_headroom", "headroom_passed", False),
+            ("production_headroom", "oom_events_last_24h", 1),
+            ("production_headroom", "vmstat_swap_in_kib_per_second", [0, 1, 0, 0, 0]),
+            ("production_headroom", "residual_after_planned_increment_kib", 0),
+        ]
+        # refuse measurements that contradict the required gate
+        for section, key, value in nested_failures:
+            invalid = copy.deepcopy(proof)
+            invalid[section][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_source_proof(invalid, images, health, 10684)
+        invalid = copy.deepcopy(proof)
+        invalid["sources"][0]["readsb_listening_tcp_ports"] = [30005]
+        with self.assertRaises(ValueError):
+            validate_source_proof(invalid, images, health, 10684)
 
     # deny all outbound feeds while no physical receiver is present
     def test_hardware_absence_inhibits_every_network(self):
@@ -79,9 +171,63 @@ class ControllerTests(unittest.TestCase):
     def test_ports_are_loopback_and_no_docker_socket(self):
         compose = compose_for(self.settings, self.runtime, self.present)
         self.assertEqual(compose["services"]["ultrafeeder"]["ports"], ["127.0.0.1:8078:80", "127.0.0.1:9274:9274"])
+        self.assertEqual(compose["services"]["airspy"]["ports"], ["127.0.0.1:8079:80"])
+        self.assertEqual(compose["services"]["dump978"]["ports"], ["127.0.0.1:8978:80"])
+        self.assertNotIn("0.0.0.0", str(compose))
         self.assertNotIn("docker.sock", str(compose))
         self.assertNotIn("privileged", str(compose))
         self.assertNotIn("fr24", str(compose))
+
+    # keep each alert tracker isolated to one physical input and no host listener
+    def test_alert_sources_use_only_fixed_physical_inputs(self):
+        compose = compose_for(self.settings, self.runtime, self.present)
+        source_1090 = compose["services"]["alert-source-1090"]
+        source_978 = compose["services"]["alert-source-978fallback"]
+        self.assertEqual("airspy", source_1090["environment"]["ALERT_SOURCE_INPUT_SERVICE"])
+        self.assertEqual("beast_in", source_1090["environment"]["ALERT_SOURCE_PROTOCOL"])
+        self.assertEqual("dump978", source_978["environment"]["ALERT_SOURCE_INPUT_SERVICE"])
+        self.assertEqual("uat_in", source_978["environment"]["ALERT_SOURCE_PROTOCOL"])
+        self.assertNotIn("ports", source_1090)
+        self.assertNotIn("ports", source_978)
+        self.assertNotIn("mlat", str(source_1090).lower())
+        self.assertEqual(["ALL"], source_1090["cap_drop"])
+        self.assertTrue(source_1090["read_only"])
+        self.assertEqual("64m", source_1090["mem_limit"])
+
+    # reserve receiver startup overhead without weakening input freshness
+    def test_alert_source_probes_budget_completion_overhead(self):
+        compose = compose_for(self.settings, self.runtime, self.present)
+        # keep both physical paths inside the seven-second coverage window
+        for name in ("alert-source-1090", "alert-source-978fallback"):
+            health = compose["services"][name]["healthcheck"]
+            self.assertEqual("1s", health["interval"])
+            self.assertEqual("5s", health["timeout"])
+
+    # render no redundant 978 tracker when the reviewed native source is selected
+    def test_native_978_selection_omits_fallback_container(self):
+        self.runtime["source_contract"]["sources"]["978"] = {
+            "mode": "native-dump978",
+            "service": "dump978",
+            "url": "http://127.0.0.1:8978/skyaware978/data/aircraft.json",
+        }
+        services = compose_for(self.settings, self.runtime, self.present)["services"]
+        self.assertIn("alert-source-1090", services)
+        self.assertNotIn("alert-source-978fallback", services)
+
+    # persist graphs and retain no more than thirty days of globe history
+    def test_persistent_graphs_and_history_retention_are_configured(self):
+        core = compose_for(self.settings, self.runtime, self.present)["services"]["ultrafeeder"]
+        environment = core["environment"]
+        self.assertEqual("30", environment["MAX_GLOBE_HISTORY"])
+        self.assertEqual("true", environment["GRAPHS1090_DARKMODE"])
+        self.assertEqual("yes", environment["ENABLE_AIRSPY"])
+        self.assertEqual("http://airspy", environment["URL_AIRSPY"])
+        self.assertIn("/var/lib/adsb/collectd:/var/lib/collectd", core["volumes"])
+        absent_environment = compose_for(self.settings, self.runtime, self.absent)["services"]["ultrafeeder"][
+            "environment"
+        ]
+        self.assertNotIn("ENABLE_AIRSPY", absent_environment)
+        self.assertNotIn("URL_AIRSPY", absent_environment)
 
     # treat connector delimiters and malformed coordinates as invalid input
     def test_rejects_injection_and_invalid_shapes(self):
@@ -332,6 +478,172 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertIn("label=com.docker.compose.service=piaware", run.call_args_list[1].args[0])
 
+    # keep malformed auxiliary state degraded without touching core uploaders
+    def test_malformed_alert_source_state_is_auxiliary_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "alert-source/1090"
+            source.mkdir(parents=True)
+            (source / "source-state.json").write_text("[" * 1500 + "0" + "]" * 1500)
+            services = {
+                "running": {"ultrafeeder", "proxy", "airspy", "alert-source-1090"},
+                "ready": {"ultrafeeder", "proxy", "airspy", "alert-source-1090"},
+                "starting": set(),
+            }
+            result = alert_status_for(self.runtime, {"airspy": True, "uat": False}, services, root)
+        self.assertEqual("degraded", result["sources"]["1090"]["state"])
+
+    # isolate unexpected auxiliary errors and log only their exception class
+    def test_alert_projection_failure_is_bounded_and_does_not_stop_core(self):
+        with mock.patch("adsb_admin.controller._alert_status_for", side_effect=ValueError("private-token")):
+            with mock.patch("adsb_admin.controller.stop_uploaders") as stop:
+                with self.assertLogs(level="WARNING") as captured:
+                    value = alert_status_for(self.runtime, self.present, {}, Path("/unused"))
+        stop.assert_not_called()
+        self.assertEqual(["1090", "978"], value["expected_bands"])
+        self.assertEqual("degraded", value["sources"]["1090"]["state"])
+        self.assertIn("ValueError", str(captured.output))
+        self.assertNotIn("private-token", str(captured.output))
+
+    # require fixed socket identity and cumulative bytes in source state
+    def test_alert_source_state_includes_socket_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "alert-source/1090"
+            source.mkdir(parents=True)
+            state = {
+                "schema_version": 2,
+                "band": "1090",
+                "generation": "2de11047-d307-4cce-a43c-4b02958e77c4",
+                "activation_id": "a" * 32,
+                "contract_digest": "b" * 64,
+                "sampled_at": "2026-09-05T00:00:00Z",
+                "process_running": True,
+                "input_connected": True,
+                "input_socket": "123456",
+                "input_bytes": 4096,
+            }
+            (source / "source-state.json").write_text(json.dumps(state), encoding="utf-8")
+            services = {
+                "running": {"ultrafeeder", "proxy", "airspy", "alert-source-1090"},
+                "ready": {"ultrafeeder", "proxy", "airspy", "alert-source-1090"},
+                "starting": set(),
+            }
+            valid = alert_status_for(self.runtime, {"airspy": True, "uat": False}, services, root)
+            # reject the older state schema without socket evidence
+            state.pop("input_socket")
+            state.pop("input_bytes")
+            (source / "source-state.json").write_text(json.dumps(state), encoding="utf-8")
+            incomplete = alert_status_for(self.runtime, {"airspy": True, "uat": False}, services, root)
+        self.assertEqual("ready", valid["sources"]["1090"]["state"])
+        self.assertEqual("degraded", incomplete["sources"]["1090"]["state"])
+
+    # catch auxiliary recreation failure inside reconciliation without feed shutdown
+    def test_alert_source_recreation_failure_does_not_stop_uploaders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = dict(self.runtime, data_dir=str(root))
+            specification = {
+                "name": "adsb",
+                "services": {"ultrafeeder": {}, "proxy": {}, "alert-source-1090": {}},
+            }
+            states = {
+                "running": {"ultrafeeder", "proxy"},
+                "ready": {"ultrafeeder", "proxy"},
+                "starting": set(),
+            }
+            with mock.patch("sys.argv", ["controller", "--data-dir", str(root), "--once"]):
+                with mock.patch("adsb_admin.controller.load_runtime", return_value=runtime):
+                    with mock.patch("adsb_admin.controller.read_settings", return_value=self.settings):
+                        with mock.patch(
+                            "adsb_admin.controller.detect_hardware", return_value={"airspy": True, "uat": False}
+                        ):
+                            with mock.patch("adsb_admin.controller.compose_for", return_value=specification):
+                                with mock.patch("adsb_admin.controller.subprocess.run"):
+                                    with mock.patch("adsb_admin.controller.service_states", return_value=states):
+                                        with mock.patch("adsb_admin.controller.connector_metrics", return_value=""):
+                                            with mock.patch(
+                                                "adsb_admin.controller.flightaware_claim_url", return_value=""
+                                            ):
+                                                with mock.patch(
+                                                    "adsb_admin.controller.alert_status_for",
+                                                    return_value={"expected_bands": ["1090"]},
+                                                ):
+                                                    with mock.patch(
+                                                        "adsb_admin.controller.recreate_services",
+                                                        side_effect=OSError("source unavailable"),
+                                                    ):
+                                                        with mock.patch(
+                                                            "adsb_admin.controller.stop_uploaders"
+                                                        ) as stop_uploaders:
+                                                            with self.assertLogs(level="ERROR"):
+                                                                main()
+            stop_uploaders.assert_not_called()
+
+    # steady auxiliary artifact failures must neither recreate nor stop healthy core feeds
+    def test_invalid_alert_proof_only_degrades_auxiliary_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "deploy/alerts").mkdir(parents=True)
+            (root / "map-ui").mkdir()
+            (root / "deploy/nginx.conf").write_text("proxy")
+            (root / "map-ui/version.json").write_text("{}")
+            (root / "deploy/alerts/source-contract.json").write_text(json.dumps(self.runtime["source_contract"]))
+            (root / "deploy/alerts/run-source.sh").write_text("launcher")
+            (root / "deploy/alerts/source-health.sh").write_text("health")
+            self.write_source_proof(root)
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(json.dumps(dict(self.runtime, source_dir=str(root), data_dir=str(root))))
+            baseline = load_runtime(runtime_path)
+            before = compose_for(self.settings, baseline, self.present)["services"]
+            proof_path = root / "deploy/alerts/source-proof.json"
+            valid_proof = proof_path.read_bytes()
+            states = {
+                "running": {"ultrafeeder", "proxy", "airspy", "dump978"},
+                "ready": {"ultrafeeder", "proxy", "airspy", "dump978"},
+                "starting": set(),
+            }
+            # exercise absent, deeply malformed, and mismatched evidence independently
+            for content in (
+                None,
+                b"[" * 1500 + b"0" + b"]" * 1500,
+                valid_proof.replace(b'"headroom_passed": true', b'"headroom_passed": false'),
+            ):
+                if content is None:
+                    proof_path.unlink(missing_ok=True)
+                else:
+                    proof_path.write_bytes(content)
+                with self.assertRaises((OSError, ValueError, RecursionError)):
+                    load_runtime(runtime_path)
+                with contextlib.ExitStack() as patches:
+                    patches.enter_context(
+                        mock.patch(
+                            "sys.argv",
+                            ["controller", "--runtime", str(runtime_path), "--data-dir", str(root), "--once"],
+                        )
+                    )
+                    patches.enter_context(mock.patch("adsb_admin.controller.read_settings", return_value=self.settings))
+                    patches.enter_context(
+                        mock.patch("adsb_admin.controller.detect_hardware", return_value=self.present)
+                    )
+                    patches.enter_context(mock.patch("adsb_admin.controller.subprocess.run", return_value=mock.Mock()))
+                    patches.enter_context(mock.patch("adsb_admin.controller.service_states", return_value=states))
+                    patches.enter_context(mock.patch("adsb_admin.controller.connector_metrics", return_value=None))
+                    patches.enter_context(mock.patch("adsb_admin.controller.ReceptionMonitor.collect", return_value={}))
+                    stop = patches.enter_context(mock.patch("adsb_admin.controller.stop_uploaders"))
+                    recreate = patches.enter_context(mock.patch("adsb_admin.controller.recreate_services"))
+                    patches.enter_context(self.assertLogs(level="WARNING"))
+                    main()
+                stop.assert_not_called()
+                recreate.assert_not_called()
+                status = json.loads((root / "status/status.json").read_text())
+                self.assertEqual("ready", status["phase"])
+                self.assertEqual("degraded", status["alerts"]["sources"]["1090"]["state"])
+                after = json.loads((root / "runtime/compose.json").read_text())["services"]
+                self.assertEqual(
+                    {name: value for name, value in before.items() if not name.startswith("alert-source-")}, after
+                )
+
     # root startup errors must trigger the same scoped shutdown as apply errors
     def test_invalid_runtime_fails_closed_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -351,10 +663,15 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "deploy").mkdir()
+            (root / "deploy/alerts").mkdir()
             (root / "map-ui").mkdir()
             (root / "map-ui/version.json").write_text('{"commit":"first"}')
             configuration = root / "deploy/nginx.conf"
             configuration.write_text("first version")
+            (root / "deploy/alerts/source-contract.json").write_text(json.dumps(self.runtime["source_contract"]))
+            (root / "deploy/alerts/run-source.sh").write_text("first launcher")
+            (root / "deploy/alerts/source-health.sh").write_text("health")
+            self.write_source_proof(root)
             runtime_path = root / "runtime.json"
             runtime = dict(self.runtime, source_dir=str(root), data_dir=str(root))
             runtime_path.write_text(json.dumps(runtime))
@@ -366,15 +683,55 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(proxy["cap_drop"], ["ALL"])
             self.assertEqual(proxy["user"], "101:101")
 
+    # include every fixed source contract byte in the recreation identity
+    def test_alert_source_script_updates_change_contract_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "deploy/alerts").mkdir(parents=True)
+            (root / "map-ui").mkdir()
+            (root / "deploy/nginx.conf").write_text("proxy")
+            (root / "map-ui/version.json").write_text('{"commit":"first"}')
+            (root / "deploy/alerts/source-contract.json").write_text(json.dumps(self.runtime["source_contract"]))
+            launcher = root / "deploy/alerts/run-source.sh"
+            launcher.write_text("first launcher")
+            (root / "deploy/alerts/source-health.sh").write_text("health")
+            self.write_source_proof(root)
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(json.dumps(dict(self.runtime, source_dir=str(root), data_dir=str(root))))
+            first = load_runtime(runtime_path)
+            launcher.write_text("second launcher")
+            second = load_runtime(runtime_path)
+            self.assertNotEqual(first["source_contract_digest"], second["source_contract_digest"])
+            proof_path = root / "deploy/alerts/source-proof.json"
+            proof = json.loads(proof_path.read_text())
+            proof["evidence_note"] = "updated immutable evidence"
+            proof_path.write_text(json.dumps(proof))
+            third = load_runtime(runtime_path)
+            self.assertNotEqual(second["source_contract_digest"], third["source_contract_digest"])
+            proof["health_sha256"] = "0" * 64
+            proof_path.write_text(json.dumps(proof))
+            with self.assertRaisesRegex(ValueError, "selection proof"):
+                load_runtime(runtime_path)
+            proof_path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                load_runtime(runtime_path)
+            source = compose_for(self.settings, second, {"airspy": True, "uat": False})["services"]["alert-source-1090"]
+            self.assertEqual(second["source_contract_digest"], source["labels"]["station.alert-source.contract"])
+
     # recreate the map container when the pinned asset bundle changes
     def test_map_bundle_updates_change_reconciliation_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "deploy").mkdir()
+            (root / "deploy/alerts").mkdir()
             (root / "deploy/nginx.conf").write_text("proxy")
             (root / "map-ui").mkdir()
             version = root / "map-ui/version.json"
             version.write_text('{"commit":"first"}')
+            (root / "deploy/alerts/source-contract.json").write_text(json.dumps(self.runtime["source_contract"]))
+            (root / "deploy/alerts/run-source.sh").write_text("launcher")
+            (root / "deploy/alerts/source-health.sh").write_text("health")
+            self.write_source_proof(root)
             runtime_path = root / "runtime.json"
             runtime_path.write_text(json.dumps(dict(self.runtime, source_dir=str(root), data_dir=str(root))))
             first = load_runtime(runtime_path)

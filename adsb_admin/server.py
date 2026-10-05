@@ -8,14 +8,16 @@ import json
 import mimetypes
 import posixpath
 import re
+import sqlite3
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
+from .alert_admin import AlertAdmin
 from .auth import (
     LoginRateLimiter,
     Session,
@@ -24,6 +26,7 @@ from .auth import (
     verify_password,
 )
 from .config import RevisionConflict, SettingsStore, ValidationError, sanitized_status
+from .maintenance import public_report
 
 MAX_BODY_BYTES = 32 * 1024
 SECURE_SESSION_COOKIE_NAME = "__Host-adsb_admin_session"
@@ -140,6 +143,7 @@ class AdminApplication:
             raise ValueError("embedded sessions require secure cookies")
         self.web_root = web_root.resolve()
         self.settings = SettingsStore(settings_path)
+        self.alerts = AlertAdmin(settings_path, status_path)
         self.status_path = status_path
         self.password_hash = password_hash
         self.origin = normalized_origin
@@ -240,6 +244,53 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, sanitized_status(self.server.application.status_path), cache=False)
             return
+        # keep package review and maintenance observations behind admin authentication
+        if path == "/api/admin/maintenance":
+            # require the same session boundary as receiver telemetry
+            if self._require_authentication() is None:
+                return
+            report = public_report(self.server.application.status_path.with_name("maintenance.json"))
+            try:
+                report["email_notifications"] = self.server.application.alerts.maintenance_email_status()
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, RecursionError):
+                # keep optional notifier failures from hiding the maintenance report
+                report["email_notifications"] = {
+                    "state": "unknown",
+                    "error": None,
+                    "reported_at": None,
+                    "accepted_at": None,
+                    "retry_at": None,
+                }
+            self._send_json(HTTPStatus.OK, report, cache=False)
+            return
+        # protect every alert projection with the existing session boundary
+        if path in ("/api/admin/alerts/config", "/api/admin/alerts/status", "/api/admin/alerts/history"):
+            # require authentication before reading any private alert state
+            if self._require_authentication() is None:
+                return
+            try:
+                alerts = self.server.application.alerts
+                # expose only the independent redacted settings
+                if path.endswith("/config"):
+                    result = alerts.settings().get_public()
+                elif path.endswith("/status"):
+                    result = alerts.status()
+                else:
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=4)
+                    # reject duplicate and unsupported pagination parameters
+                    if any(key not in ("before", "limit") or len(values) != 1 for key, values in query.items()):
+                        raise ValueError("invalid history request")
+                    result = alerts.history(
+                        before=query.get("before", [None])[0], limit=int(query.get("limit", ["50"])[0])
+                    )
+            except ValueError:
+                self._send_error(HTTPStatus.BAD_REQUEST, "invalid_request")
+                return
+            except (OSError, RuntimeError, KeyError, TypeError, sqlite3.Error):
+                self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "alerts_unavailable")
+                return
+            self._send_json(HTTPStatus.OK, result, cache=False)
+            return
         # reject unknown api routes
         if path.startswith("/api/"):
             self._send_error(HTTPStatus.NOT_FOUND, "not_found")
@@ -300,6 +351,31 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self.server.application.sessions.delete(auth.token)
             self._send_json(HTTPStatus.OK, {"authenticated": False}, cache=False, clear_cookie=True)
             return
+        # hand off only an intentional fixed-content dual-channel test
+        if path == "/api/admin/alerts/test":
+            auth = self._require_authentication()
+            # require the existing session and csrf protections
+            if auth is None or not self._require_csrf(auth):
+                return
+            payload = self._read_json()
+            # stop after a body parsing response
+            if payload is None:
+                return
+            try:
+                status, result = self.server.application.alerts.request_test(payload)
+            except RevisionConflict as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": "revision_conflict", "config": exc.current}, cache=False)
+                return
+            except ValidationError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "invalid_request", "fields": exc.fields}, cache=False
+                )
+                return
+            except (OSError, RuntimeError, sqlite3.Error):
+                self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "alerts_unavailable")
+                return
+            self._send_json(status, result, cache=False)
+            return
         self.close_connection = True
         self._send_error(HTTPStatus.NOT_FOUND, "not_found")
 
@@ -307,7 +383,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         path = urlsplit(self.path).path
         # accept only the configuration route
-        if path != "/api/admin/config":
+        if path not in ("/api/admin/config", "/api/admin/alerts/config"):
             self.close_connection = True
             self._send_error(HTTPStatus.NOT_FOUND, "not_found")
             return
@@ -326,7 +402,13 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         if payload is None:
             return
         try:
-            updated = self.server.application.settings.update(payload)
+            # keep station and alert revisions independent
+            store = (
+                self.server.application.alerts.settings()
+                if path.endswith("/alerts/config")
+                else self.server.application.settings
+            )
+            updated = store.update(payload)
         except RevisionConflict as exc:
             self._send_json(
                 HTTPStatus.CONFLICT,
@@ -340,6 +422,9 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 {"error": "invalid_request", "fields": exc.fields},
                 cache=False,
             )
+            return
+        except (OSError, RuntimeError):
+            self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "settings_unavailable")
             return
         self._send_json(HTTPStatus.OK, updated, cache=False)
 
