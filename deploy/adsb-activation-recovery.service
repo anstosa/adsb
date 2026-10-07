@@ -1,0 +1,18 @@
+[Unit]
+Description=Recover an interrupted ADS-B release activation
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service adsb-admin.service adsb-controller.service adsb-alerts.service adsb-updater.path multi-user.target
+ConditionPathExists=/var/lib/adsb/runtime/activation-journal.json
+RequiresMountsFor=/opt/adsb /var/lib/adsb
+
+[Service]
+Type=oneshot
+User=root
+Environment=ADSB_BOOT_RECOVERY=1
+ExecStart=/usr/bin/bash @ADSB_RECOVERY_INSTALLER@ --recover-only
+TimeoutStartSec=10min
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

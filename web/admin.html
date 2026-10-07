@@ -132,7 +132,7 @@
         <section class="panel maintenance-panel" aria-labelledby="maintenance-heading">
           <div class="section-heading maintenance-heading">
             <div>
-              <div class="eyebrow">Weekly review</div>
+              <div class="eyebrow">Weekly updates</div>
               <h2 id="maintenance-heading">Software maintenance</h2>
             </div>
             <span class="maintenance-state maintenance-unknown" id="maintenance-state">Report unavailable</span>
@@ -140,7 +140,7 @@
           <p class="maintenance-summary" id="maintenance-summary">No completed maintenance report has been received.</p>
           <dl class="maintenance-details">
             <div>
-              <dt>Last review</dt>
+              <dt>Last check</dt>
               <dd id="maintenance-updated">—</dd>
             </div>
             <div>
@@ -149,7 +149,7 @@
             </div>
             <div>
               <dt>Application policy</dt>
-              <dd id="maintenance-policy">Pinned releases; updates require review</dd>
+              <dd id="maintenance-policy">Clearly compatible updates install automatically; breaking or unknown updates are held for your Install action</dd>
             </div>
             <div>
               <dt>Disk free</dt>
@@ -160,7 +160,7 @@
               <dd id="maintenance-reboot">Unknown</dd>
             </div>
             <div>
-              <dt>Release review</dt>
+              <dt>Application updates</dt>
               <dd id="maintenance-releases">Unknown</dd>
             </div>
             <div>
@@ -168,8 +168,23 @@
               <dd id="maintenance-email-notification">SMTP not configured</dd>
             </div>
           </dl>
+          <div class="maintenance-installation" id="maintenance-installation" role="status" aria-live="polite" hidden></div>
+          <section class="maintenance-updates" aria-labelledby="maintenance-updates-heading">
+            <div class="maintenance-updates-heading">
+              <h3 id="maintenance-updates-heading">Application updates</h3>
+              <small>Select updates to install their exact versions together.</small>
+            </div>
+            <div class="maintenance-batch-actions">
+              <span id="maintenance-selection-count" role="status" aria-live="polite">No updates selected</span>
+              <button class="button button-primary" id="maintenance-install-selected" type="button" disabled>Install selected</button>
+            </div>
+            <div class="maintenance-update-list" id="maintenance-update-list">
+              <p class="empty-state">No application updates are pending.</p>
+            </div>
+          </section>
           <p class="maintenance-note">Security updates may restart receiver services. Reboots are reported for review and are not performed automatically.</p>
-          <p class="maintenance-note">One email is queued for each new completed maintenance review when the shared SMTP settings below are configured. Older reports are not replayed, and Pushover is not used.</p>
+          <p class="maintenance-note">Clearly compatible application updates install automatically. Breaking or unknown updates are held for your explicit Install action.</p>
+          <p class="maintenance-note">Email is queued for newly held updates and terminal installation failures when the shared SMTP settings below are configured. Unchanged held candidates are not emailed again, and Pushover is not used.</p>
         </section>
 
         <section class="alerts-shell" aria-labelledby="alerts-heading">
@@ -178,7 +193,7 @@
               <div>
                 <div class="eyebrow">Station-local notifications</div>
                 <h2 id="alerts-heading">Aircraft alerts</h2>
-                <p>Send one Pushover notification and one email for each qualifying local encounter. An aircraft becomes eligible again only after at least 10 minutes of verified absence.</p>
+                <p>Choose push, email, or both for each aircraft type. An aircraft becomes eligible again only after at least 10 minutes of verified absence.</p>
               </div>
               <span class="alert-state alert-unknown" id="alerts-overall-state">Loading</span>
             </div>
@@ -245,7 +260,7 @@
               <div class="alert-enable-row">
                 <div>
                   <strong>Enable aircraft alerts</strong>
-                  <p>Both Pushover and email must be configured. Pushover uses normal priority and respects device quiet hours.</p>
+                  <p>Configure only the delivery channels you select below. Push uses Pushover at normal priority and respects device quiet hours.</p>
                 </div>
                 <label class="switch-control">
                   <span class="switch-label">Alerts enabled</span>
@@ -256,20 +271,23 @@
 
               <fieldset class="alert-fieldset">
                 <legend>Aircraft categories</legend>
-                <p class="fieldset-help">Select every known role that should create an alert. Familiar and frequently seen aircraft still qualify.</p>
+                <p class="fieldset-help">Check push, email, or both next to each type. Leave both unchecked to turn that type off. Aircraft qualify only with a fresh radio-derived position within 5 miles of the configured Whidbey receiver. Familiar and frequently seen aircraft still qualify; missing, stale, and MLAT-only positions do not.</p>
                 <div class="category-options">
-                  <label class="check-card" for="alerts-category-military">
-                    <input id="alerts-category-military" type="checkbox" value="military" checked>
+                  <div class="category-row" role="group" aria-label="Military delivery">
                     <span><strong>Military</strong><small>Known military identities</small></span>
-                  </label>
-                  <label class="check-card" for="alerts-category-medical">
-                    <input id="alerts-category-medical" type="checkbox" value="medical" checked>
+                    <label class="category-channel"><input id="alerts-category-military-pushover" type="checkbox" aria-label="Military push" checked>Push</label>
+                    <label class="category-channel"><input id="alerts-category-military-email" type="checkbox" aria-label="Military email" checked>Email</label>
+                  </div>
+                  <div class="category-row" role="group" aria-label="Medical delivery">
                     <span><strong>Medical</strong><small>Known air-ambulance identities</small></span>
-                  </label>
-                  <label class="check-card" for="alerts-category-news">
-                    <input id="alerts-category-news" type="checkbox" value="news" checked>
+                    <label class="category-channel"><input id="alerts-category-medical-pushover" type="checkbox" aria-label="Medical push" checked>Push</label>
+                    <label class="category-channel"><input id="alerts-category-medical-email" type="checkbox" aria-label="Medical email" checked>Email</label>
+                  </div>
+                  <div class="category-row" role="group" aria-label="News delivery">
                     <span><strong>News</strong><small>Known news and media aircraft</small></span>
-                  </label>
+                    <label class="category-channel"><input id="alerts-category-news-pushover" type="checkbox" aria-label="News push" checked>Push</label>
+                    <label class="category-channel"><input id="alerts-category-news-email" type="checkbox" aria-label="News email" checked>Email</label>
+                  </div>
                 </div>
                 <small class="input-error" id="alerts-categories-error" hidden></small>
               </fieldset>
@@ -351,15 +369,18 @@
               </div>
 
               <fieldset class="alert-fieldset override-fieldset">
-                <legend>Exact ICAO overrides</legend>
+                <legend>Aircraft overrides</legend>
                 <div class="fieldset-heading">
                   <div>
-                    <p class="fieldset-help">Include or exclude one six-character hexadecimal ICAO address. Overrides do not infer roles from aircraft model, squawk, or a generic helicopter label.</p>
+                    <p class="fieldset-help">Include or exclude an exact six-character ICAO address or a 2–4 character ICAO model type code such as C17 or H60. Model rules require available type metadata and apply only to locally received aircraft. Model names and wildcards are not accepted. Exclusions win when rules overlap; exact-aircraft labels take precedence.</p>
                   </div>
-                  <button class="button button-quiet" id="alerts-add-override" type="button">Add aircraft</button>
+                  <div class="override-actions">
+                    <button class="button button-quiet" id="alerts-add-override" type="button">Add aircraft</button>
+                    <button class="button button-quiet" id="alerts-add-model-override" type="button">Add model</button>
+                  </div>
                 </div>
                 <div class="override-list" id="alerts-override-list"></div>
-                <p class="empty-state compact" id="alerts-overrides-empty">No exact aircraft overrides.</p>
+                <p class="empty-state compact" id="alerts-overrides-empty">No aircraft or model overrides.</p>
                 <small class="input-error" id="alerts-overrides-error" hidden></small>
               </fieldset>
 
@@ -378,7 +399,7 @@
             <div>
               <div class="eyebrow">Delivery check</div>
               <h3>Send an intentional test</h3>
-              <p>This sends a clearly labeled non-aircraft test to both configured channels. “Queued” means the request was recorded, not delivered, accepted, read, or received.</p>
+              <p>This sends a clearly labeled non-aircraft test to every configured channel, regardless of aircraft-type selections. “Queued” means the request was recorded, not delivered, accepted, read, or received.</p>
               <div class="test-channel-results" id="alerts-test-results" aria-live="polite"></div>
               <p class="save-message" id="alerts-test-message" role="status" aria-live="polite"></p>
             </div>

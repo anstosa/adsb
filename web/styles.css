@@ -615,6 +615,224 @@ input:invalid:not(:placeholder-shown) {
   color: var(--muted);
 }
 
+.maintenance-installation {
+  margin-top: 1rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgb(94 142 156 / 28%);
+  border-radius: 10px;
+  color: #dbe9e9;
+  background: rgb(31 93 105 / 12%);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.maintenance-installation-success {
+  border-color: rgb(108 224 166 / 30%);
+  color: var(--success);
+  background: rgb(108 224 166 / 8%);
+}
+
+.maintenance-installation-error {
+  border-color: rgb(255 119 119 / 30%);
+  color: #ffb4b4;
+  background: rgb(255 119 119 / 8%);
+}
+
+.maintenance-updates {
+  margin-top: 1.25rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.maintenance-updates-heading,
+.maintenance-update-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.maintenance-updates-heading h3,
+.maintenance-update-heading h4 {
+  margin: 0;
+}
+
+.maintenance-updates-heading h3 {
+  font-size: 0.92rem;
+}
+
+.maintenance-updates-heading small,
+.maintenance-update-heading small {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.maintenance-update-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+  margin-top: 0.9rem;
+}
+
+.maintenance-update-list > .empty-state {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.maintenance-update-card {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgb(3 13 21 / 32%);
+}
+
+/* reserve the upper-left checkbox column */
+.maintenance-update-heading {
+  display: grid;
+  grid-template-columns: 2.75rem minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.5rem 0.8rem;
+}
+
+.maintenance-update-heading > div {
+  min-width: 0;
+}
+
+.maintenance-update-heading h4,
+.maintenance-update-heading small {
+  overflow-wrap: anywhere;
+}
+
+.maintenance-update-heading small {
+  display: block;
+  margin-top: 0.2rem;
+}
+
+.maintenance-update-state {
+  display: inline-flex;
+  flex: 0 0 auto;
+  max-width: 12rem;
+  padding: 0.28rem 0.48rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgb(255 255 255 / 3%);
+  font-size: 0.6rem;
+  font-weight: 800;
+  line-height: 1.35;
+  text-align: center;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.update-state-compatible {
+  border-color: rgb(108 224 166 / 30%);
+  color: var(--success);
+  background: rgb(108 224 166 / 8%);
+}
+
+.update-state-breaking,
+.update-state-unknown {
+  border-color: rgb(247 189 98 / 30%);
+  color: var(--amber);
+  background: rgb(247 189 98 / 8%);
+}
+
+.maintenance-update-versions {
+  margin: 0.8rem 0 0;
+  color: #dbe9e9;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.maintenance-update-reason {
+  margin: 0.7rem 0 0;
+  color: #aebfc7;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.maintenance-changelog {
+  margin-top: 0.8rem;
+  color: #cbdadd;
+  font-size: 0.72rem;
+}
+
+.maintenance-changelog summary {
+  width: fit-content;
+  color: var(--teal);
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.maintenance-changelog pre {
+  max-height: 16rem;
+  margin: 0.65rem 0 0;
+  padding: 0.75rem;
+  border-radius: 8px;
+  color: #b8c9cf;
+  background: rgb(0 0 0 / 20%);
+  font: inherit;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.maintenance-update-actions {
+  align-items: flex-end;
+  margin-top: 0.9rem;
+}
+
+.maintenance-changelog-link {
+  color: var(--teal);
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.maintenance-batch-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.maintenance-batch-actions > span {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* keep the compact checkbox inside a touch-sized label */
+.maintenance-update-selection {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  width: 2.75rem;
+  min-height: 2.75rem;
+  padding-top: 0.15rem;
+  cursor: pointer;
+}
+
+.maintenance-update-selection input {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.maintenance-update-progress {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
 .revision-label {
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1059,42 +1277,51 @@ input:invalid:not(:placeholder-shown) {
 
 .category-options {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 0.75rem;
 }
 
-.check-card {
-  display: flex;
+.category-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 75px 75px;
   gap: 0.65rem;
-  align-items: flex-start;
+  align-items: center;
   padding: 0.78rem;
   border: 1px solid var(--border);
   border-radius: 9px;
-  cursor: pointer;
 }
 
-.check-card:has(input:checked) {
+.category-row:has(input:checked) {
   border-color: rgb(57 208 189 / 48%);
   background: rgb(57 208 189 / 7%);
 }
 
-.check-card input {
+.category-channel {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 44px;
+  cursor: pointer;
+  font-size: 0.79rem;
+}
+
+.category-channel input {
   width: 17px;
   height: 17px;
   flex: 0 0 auto;
   accent-color: var(--teal);
 }
 
-.check-card strong,
-.check-card small {
+.category-row strong,
+.category-row small {
   display: block;
 }
 
-.check-card strong {
+.category-row strong {
   font-size: 0.79rem;
 }
 
-.check-card small {
+.category-row small {
   margin-top: 0.16rem;
   color: var(--muted);
   font-size: 0.69rem;
@@ -1167,6 +1394,12 @@ select option {
 .override-list {
   display: grid;
   gap: 0.75rem;
+}
+
+.override-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.5rem;
 }
 
 .override-row {
@@ -1479,6 +1712,7 @@ footer a {
 
   .reception-grid,
   .maintenance-details,
+  .maintenance-update-list,
   .alert-provider-grid {
     grid-template-columns: 1fr;
   }
@@ -1527,11 +1761,33 @@ footer a {
 
   .reception-heading,
   .maintenance-heading,
+  .maintenance-updates-heading,
+  .maintenance-update-actions,
   .alerts-heading,
   .alerts-form-heading,
   .alert-history-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  /* keep both identity lines beside the checkbox on mobile */
+  .maintenance-update-heading {
+    grid-template-columns: 2.75rem minmax(0, 1fr);
+  }
+
+  /* wrap the status below the identity instead of squeezing its name */
+  .maintenance-update-state {
+    grid-column: 2;
+    justify-self: start;
+    max-width: 100%;
+  }
+
+  .maintenance-update-actions {
+    align-items: stretch;
+  }
+
+  #maintenance-install-selected {
+    width: 100%;
   }
 
   .station-fields,
@@ -1577,10 +1833,24 @@ footer a {
     grid-column: auto;
   }
 
+  .category-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.3rem 0.65rem;
+  }
+
+  .category-row > span {
+    grid-column: 1 / -1;
+  }
+
   .alert-enable-row,
   .alert-test-panel,
   .alert-form-actions,
   .fieldset-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .override-actions {
     align-items: stretch;
     flex-direction: column;
   }

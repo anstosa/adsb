@@ -2,24 +2,44 @@
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import math
 import os
 import re
 import stat
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
+from adsb_admin.alert_catalog import normalize_aircraft_model
+
 AIRSPY_URL = "http://127.0.0.1:8079/stats.json"
 UAT_URL = "http://127.0.0.1:8978/skyaware978/data/aircraft.json"
 MAP_URL = "http://127.0.0.1:8078/data/aircraft.json"
 MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_DATABASE_COMPRESSED_BYTES = 256 * 1024
+MAX_DATABASE_PAGES = 32
+MAX_DATABASE_MODELS = 4096
+MAX_DATABASE_FETCHES = 4
+MAX_AIRCRAFT_METADATA = 4096
+MAX_OPERATOR_PREFIXES = 7000
+MAX_TYPE_NAMES = 4000
 MAX_ROWS = 10_000
 HEX_PATTERN = re.compile(r"^[0-9a-fA-F]{6}$")
+DATABASE_DIRECTORY_PATTERN = re.compile(r"^db-[0-9]+(?:\.[0-9]+){2}$")
+DATABASE_PREFIX_PATTERN = re.compile(r"^[0-9A-F]{1,6}$")
+DATABASE_METADATA_ROUTES = frozenset(("icao_aircraft_types2", "operators"))
+OPERATOR_PREFIX_PATTERN = re.compile(r"^[A-Z]{3}$")
+REGISTRATION_PATTERN = re.compile(r"^[A-Z0-9+-]{1,20}$")
 GENERATION_PATTERN = re.compile(r"^[0-9a-f-]{36}$")
+RELEASE_ROOT = Path(__file__).resolve().parents[1]
+MAP_UI_MANIFEST_PATH = RELEASE_ROOT / "deploy/map-ui.json"
+EARTH_RADIUS_MI = 3958.7613
 
 
 # reject redirects from fixed receiver endpoints
@@ -88,6 +108,65 @@ def fetch_json(url: str) -> dict[str, Any]:
     return value
 
 
+# load the release-pinned local aircraft database directory
+def load_database_directory(manifest_path: Path = MAP_UI_MANIFEST_PATH) -> str:
+    manifest = read_json(manifest_path, 64 * 1024)
+    dependency = manifest.get("base_image_dependency")
+    version = manifest.get("databaseVersion")
+    # bind the route to the immutable release manifest
+    if (
+        manifest.get("schema_version") != 1
+        or not isinstance(dependency, dict)
+        or not isinstance(version, str)
+        or dependency.get("database_directory") != f"db-{version}"
+        or DATABASE_DIRECTORY_PATTERN.fullmatch(dependency.get("database_directory", "")) is None
+    ):
+        raise ValueError("invalid map database manifest")
+    return dependency["database_directory"]
+
+
+# fetch one bounded gzip or json page from the fixed local map endpoint
+def fetch_database_json(url: str, database_directory: str) -> dict[str, Any]:
+    # reject caller-controlled directory shapes before constructing the route
+    if DATABASE_DIRECTORY_PATTERN.fullmatch(database_directory) is None:
+        raise ValueError("invalid database directory")
+    base_url = f"http://127.0.0.1:8078/{database_directory}/"
+    suffix = url.removeprefix(base_url).removesuffix(".js")
+    # prevent alternate hosts, paths and encoded traversal
+    if (
+        url != f"{base_url}{suffix}.js"
+        or DATABASE_PREFIX_PATTERN.fullmatch(suffix) is None
+        and suffix not in DATABASE_METADATA_ROUTES
+    ):
+        raise ValueError("invalid database endpoint")
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    with opener.open(url, timeout=0.35) as response:
+        content = response.read(MAX_DATABASE_COMPRESSED_BYTES + 1)
+    # bound the on-wire database page
+    if len(content) > MAX_DATABASE_COMPRESSED_BYTES:
+        raise ValueError("oversized database response")
+    try:
+        # decode only the database's native gzip representation
+        if content.startswith(b"\x1f\x8b"):
+            with gzip.GzipFile(fileobj=io.BytesIO(content)) as stream:
+                decoded = stream.read(MAX_JSON_BYTES + 1)
+        else:
+            decoded = content
+    except (EOFError, OSError) as error:
+        raise ValueError("invalid database compression") from error
+    # cap decompression using the existing native-json ceiling
+    if len(decoded) > MAX_JSON_BYTES:
+        raise ValueError("oversized database document")
+    try:
+        value = json.loads(decoded)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("invalid database response") from error
+    # require one static database page
+    if not isinstance(value, dict):
+        raise ValueError("invalid database response")
+    return value
+
+
 # normalize a controller timestamp
 def _timestamp(value: Any) -> float:
     # accept the fixed controller utc string schema
@@ -107,8 +186,118 @@ def _fresh(timestamp: float, now: float, maximum: float) -> None:
         raise ValueError("stale source publication")
 
 
+# accept one optional finite number inside a closed interval
+def _optional_number(value: Any, lower: float, upper: float) -> float | None:
+    # discard malformed telemetry without invalidating physical reception
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    number = float(value)
+    # keep downstream fields inside their documented physical bounds
+    if number < lower or number > upper:
+        return None
+    return number
+
+
+# accept one bounded printable metadata string
+def _optional_text(value: Any, maximum: int = 120) -> str | None:
+    # discard nontext and control-bearing metadata
+    if not isinstance(value, str) or len(value) > maximum or any(ord(character) < 32 for character in value):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+# normalize one registration for callsign safety comparisons
+def _registration(value: Any) -> str | None:
+    text = _optional_text(value, 20)
+    # accept only the pinned database registration alphabet
+    if text is None or REGISTRATION_PATTERN.fullmatch(text.upper()) is None:
+        return None
+    return text.upper()
+
+
+# retain one bounded physical decoder callsign for later operator lookup
+def _flight(value: Any) -> str | None:
+    text = _optional_text(value, 32)
+    return text.upper() if text is not None else None
+
+
+# calculate one great-circle distance in statute miles
+def _distance_mi(latitude: float, longitude: float, station: tuple[float, float]) -> float:
+    station_latitude, station_longitude = station
+    latitude_delta = math.radians(latitude - station_latitude)
+    longitude_delta = math.radians(longitude - station_longitude)
+    origin = math.radians(station_latitude)
+    destination = math.radians(latitude)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(origin) * math.cos(destination) * math.sin(longitude_delta / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_MI * math.asin(math.sqrt(min(1.0, haversine)))
+
+
+# attach bounded current telemetry without changing reception validity
+def _attach_telemetry(
+    normalized: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    timestamp: float,
+    now: float,
+    station: tuple[float, float] | None,
+) -> None:
+    normalized["location_center"] = station
+    speed = _optional_number(row.get("gs"), 0, 2_000)
+    # retain only a plausible ground-speed measurement
+    if speed is not None:
+        normalized["speed_knots"] = speed
+    heading = _optional_number(row.get("track"), 0, 360)
+    # normalize the equivalent full-turn bearing to north
+    if heading is not None:
+        normalized["heading_degrees"] = heading % 360
+    normalized["on_ground"] = row.get("alt_baro") == "ground"
+    altitude = _optional_number(row.get("alt_baro"), -10_000, 100_000)
+    # fall back to geometric altitude when barometric altitude is absent
+    if altitude is None:
+        altitude = _optional_number(row.get("alt_geom"), -10_000, 100_000)
+    # retain only one defensively bounded altitude
+    if altitude is not None:
+        normalized["altitude_feet"] = altitude
+    flight = _flight(row.get("flight"))
+    # retain callsigns only from the physical decoder row
+    if flight is not None:
+        normalized["_flight"] = flight
+    latitude = _optional_number(row.get("lat"), -90, 90)
+    longitude = _optional_number(row.get("lon"), -180, 180)
+    seen_position = _optional_number(row.get("seen_pos"), 0, 5)
+    mlat_fields = row.get("mlat", [])
+    mlat_position = (
+        not isinstance(mlat_fields, list)
+        or any(not isinstance(field, str) for field in mlat_fields)
+        or "lat" in mlat_fields
+        or "lon" in mlat_fields
+    )
+    # use only fresh decoder coordinates that are not derived from mlat
+    if (
+        station is not None
+        and latitude is not None
+        and longitude is not None
+        and seen_position is not None
+        and not mlat_position
+    ):
+        normalized["latitude"] = latitude
+        normalized["longitude"] = longitude
+        normalized["distance_mi"] = _distance_mi(latitude, longitude, station)
+        normalized["position_observed_at"] = min(now, timestamp - seen_position)
+
+
 # observe one physical-only tracked aircraft schema
-def normalize_aircraft(payload: dict[str, Any], *, now: float, band: str = "1090") -> list[dict[str, Any]]:
+def normalize_aircraft(
+    payload: dict[str, Any],
+    *,
+    now: float,
+    band: str = "1090",
+    station: tuple[float, float] | None = None,
+) -> list[dict[str, Any]]:
     timestamp = _number(payload.get("now"))
     _fresh(timestamp, now, 5)
     _counter(payload.get("messages"))
@@ -141,18 +330,18 @@ def normalize_aircraft(payload: dict[str, Any], *, now: float, band: str = "1090
         # reject malformed ages without requiring a position
         if seen < 0 or seen > 3600:
             raise ValueError("invalid source age")
-        normalized.append(
-            {
-                "hex": hex_id,
-                "messages": messages,
-                "seen": seen,
-                "observed_at": timestamp - seen - 0.1,
-                "last_observed_at": min(now, timestamp - seen + 1.1),
-                "reception": "rebroadcast"
-                if row.get("type") == "tisb_icao" or (band == "1090" and row.get("type") == "adsr_icao")
-                else "direct",
-            }
-        )
+        aircraft = {
+            "hex": hex_id,
+            "messages": messages,
+            "seen": seen,
+            "observed_at": timestamp - seen - 0.1,
+            "last_observed_at": min(now, timestamp - seen + 1.1),
+            "reception": "rebroadcast"
+            if row.get("type") == "tisb_icao" or (band == "1090" and row.get("type") == "adsr_icao")
+            else "direct",
+        }
+        _attach_telemetry(aircraft, row, timestamp=timestamp, now=now, station=station)
+        normalized.append(aircraft)
     return normalized
 
 
@@ -165,6 +354,9 @@ class AlertSourceMonitor:
         root: Path = Path("/var/lib/adsb"),
         manifest_path: Path = Path("/opt/adsb/current/deploy/alerts/source-contract.json"),
         fetcher: Callable[[str], dict[str, Any]] = fetch_json,
+        database_fetcher: Callable[[str], dict[str, Any]] | None = None,
+        metadata_fetcher: Callable[[str], dict[str, Any]] | None = None,
+        map_manifest_path: Path = MAP_UI_MANIFEST_PATH,
     ) -> None:
         from .controller import validate_source_contract
 
@@ -174,14 +366,292 @@ class AlertSourceMonitor:
         if any(source["mode"] != "readsb" for source in self.manifest["sources"].values()):
             raise ValueError("source adapter was not selected by the release")
         self.fetcher = fetcher
+        self.database_directory = load_database_directory(map_manifest_path)
+        self.database_fetcher = database_fetcher or (lambda url: fetch_database_json(url, self.database_directory))
+        self.metadata_fetcher = metadata_fetcher or (lambda url: fetch_database_json(url, self.database_directory))
         self.activation_id = ""
         self.contract_digest = ""
         self._states: dict[str, dict[str, Any]] = {}
         self._bands: dict[str, dict[str, Any]] = {}
         self._last_poll: tuple[float, float] | None = None
+        self._database_pages: OrderedDict[str, tuple[str, ...]] = OrderedDict()
+        self._model_cache: OrderedDict[str, str] = OrderedDict()
+        self._aircraft_metadata_cache: OrderedDict[str, dict[str, str]] = OrderedDict()
+        self._aircraft_cache_completeness: OrderedDict[str, tuple[bool, bool]] = OrderedDict()
+        self._operator_cache: dict[str, str] | None = None
+        self._type_name_cache: dict[str, str] | None = None
+        self._model_cursor = 0
+
+    # read only the bounded configured station coordinates
+    def _station_position(self) -> tuple[float, float] | None:
+        try:
+            settings = read_json(self.root / "config/settings.json", 64 * 1024)
+        except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+            return None
+        station = settings.get("station")
+        # treat unavailable location as optional observation metadata
+        if not isinstance(station, dict):
+            return None
+        latitude = _optional_number(station.get("latitude"), -90, 90)
+        longitude = _optional_number(station.get("longitude"), -180, 180)
+        # require both coordinates before measuring a radius
+        if latitude is None or longitude is None:
+            return None
+        return latitude, longitude
+
+    # validate one page and retain only bounded normalized metadata
+    def _parse_database_page(
+        self, prefix: str, document: dict[str, Any], identity: str
+    ) -> tuple[tuple[str, ...], dict[str, str], dict[str, dict[str, str]], dict[str, str] | None]:
+        # accept only a strict uppercase trie key
+        if DATABASE_PREFIX_PATTERN.fullmatch(prefix) is None or not identity.startswith(prefix):
+            raise ValueError("invalid database prefix")
+        children_value = document.get("children", [])
+        # constrain child fanout to the next exact trie level
+        if (
+            not isinstance(children_value, list)
+            or len(children_value) > 16
+            or any(
+                not isinstance(child, str)
+                or len(child) != len(prefix) + 1
+                or not child.startswith(prefix)
+                or DATABASE_PREFIX_PATTERN.fullmatch(child) is None
+                for child in children_value
+            )
+            or len(set(children_value)) != len(children_value)
+        ):
+            raise ValueError("invalid database children")
+        children = tuple(children_value)
+        suffix_length = 6 - len(prefix)
+        suffix_pattern = re.compile(rf"^[0-9A-F]{{{suffix_length}}}$")
+        retained_models: dict[str, str] = {}
+        retained_metadata: dict[str, dict[str, str]] = {}
+        target: dict[str, str] | None = None
+        # validate every row while retaining only normalized bounded fields
+        for suffix, row in document.items():
+            # skip the separately validated trie control row
+            if suffix == "children":
+                continue
+            # reject malformed exact aircraft rows
+            if (
+                not isinstance(suffix, str)
+                or suffix_pattern.fullmatch(suffix) is None
+                or not isinstance(row, list)
+                or len(row) != 4
+            ):
+                raise ValueError("invalid database row")
+            full_identity = f"{prefix}{suffix}"
+            model = normalize_aircraft_model(row[1])
+            registration = _registration(row[0])
+            type_name = _optional_text(row[3])
+            metadata = {}
+            # retain one validated registration field
+            if registration is not None:
+                metadata["registration"] = registration
+            # retain one validated long type field
+            if type_name is not None:
+                metadata["type_name"] = type_name
+            # keep a bounded positive model sample
+            if model is not None and len(retained_models) < MAX_DATABASE_MODELS:
+                retained_models[full_identity] = model
+            # keep a bounded positive metadata sample
+            if metadata and len(retained_metadata) < MAX_AIRCRAFT_METADATA:
+                retained_metadata[full_identity] = metadata
+            # preserve the requested target even past either sample bound
+            if full_identity == identity:
+                # retain the target model past the sampling limit
+                if model is not None:
+                    retained_models[full_identity] = model
+                # retain the target metadata past the sampling limit
+                if metadata:
+                    retained_metadata[full_identity] = metadata
+                target = {**metadata, **({"model": model} if model is not None else {})}
+        # make the requested result newest during global lru insertion
+        if target is not None:
+            # refresh the retained target model order
+            if identity in retained_models:
+                retained_models[identity] = retained_models.pop(identity)
+            # refresh the retained target metadata order
+            if identity in retained_metadata:
+                retained_metadata[identity] = retained_metadata.pop(identity)
+        return children, retained_models, retained_metadata, target
+
+    # merge one validated page into the bounded lru caches
+    def _cache_database_page(
+        self,
+        prefix: str,
+        children: tuple[str, ...],
+        models: dict[str, str],
+        metadata: dict[str, dict[str, str]] | None = None,
+    ) -> None:
+        self._database_pages[prefix] = children
+        self._database_pages.move_to_end(prefix)
+        # retain at most the most recently parsed prefix pages
+        while len(self._database_pages) > MAX_DATABASE_PAGES:
+            self._database_pages.popitem(last=False)
+        # merge only normalized identity-to-model entries
+        for identity, model in models.items():
+            self._model_cache[identity] = model
+            self._model_cache.move_to_end(identity)
+        # evict the least recently used model entries globally
+        while len(self._model_cache) > MAX_DATABASE_MODELS:
+            self._model_cache.popitem(last=False)
+
+        # merge only validated registration and description metadata
+        for identity, fields in (metadata or {}).items():
+            self._aircraft_metadata_cache[identity] = fields
+            self._aircraft_metadata_cache.move_to_end(identity)
+        # evict the least recently used metadata entries globally
+        while len(self._aircraft_metadata_cache) > MAX_AIRCRAFT_METADATA:
+            self._aircraft_metadata_cache.popitem(last=False)
+
+        present_metadata = metadata or {}
+        identities = list(models)
+        identities.extend(identity for identity in present_metadata if identity not in models)
+        # record which positive halves the immutable exact row originally supplied
+        for identity in identities:
+            expected_model, expected_metadata = self._aircraft_cache_completeness.get(identity, (False, False))
+            self._aircraft_cache_completeness[identity] = (
+                expected_model or identity in models,
+                expected_metadata or identity in present_metadata,
+            )
+            self._aircraft_cache_completeness.move_to_end(identity)
+        # bound completeness independently from either projected value cache
+        while len(self._aircraft_cache_completeness) > MAX_AIRCRAFT_METADATA:
+            self._aircraft_cache_completeness.popitem(last=False)
+
+    # resolve one proven physical identity through the pinned static trie
+    def _resolve_static_aircraft(self, identity: str, fetch_budget: list[int]) -> dict[str, str]:
+        cached_model = self._model_cache.get(identity)
+        cached_metadata = self._aircraft_metadata_cache.get(identity)
+        completeness = self._aircraft_cache_completeness.get(identity)
+        complete = completeness is not None and (
+            (not completeness[0] or cached_model is not None) and (not completeness[1] or cached_metadata is not None)
+        )
+        # reuse only complete validated exact-row projections
+        if complete:
+            self._aircraft_cache_completeness.move_to_end(identity)
+            # refresh one present model projection
+            if cached_model is not None:
+                self._model_cache.move_to_end(identity)
+            # refresh one present metadata projection
+            if cached_metadata is not None:
+                self._aircraft_metadata_cache.move_to_end(identity)
+            return {**(cached_metadata or {}), **({"model": cached_model} if cached_model is not None else {})}
+        # walk from the documented one-character root
+        for length in range(1, 7):
+            prefix = identity[:length]
+            next_prefix = identity[: length + 1]
+            cached_children = self._database_pages.get(prefix)
+            # reuse only a validated positive routing edge
+            if length < 6 and cached_children is not None and next_prefix in cached_children:
+                self._database_pages.move_to_end(prefix)
+                continue
+            # stop before exceeding the shared per-poll transport budget
+            if fetch_budget[0] <= 0:
+                return {}
+            fetch_budget[0] -= 1
+            url = f"http://127.0.0.1:8078/{self.database_directory}/{prefix}.js"
+            document = self.database_fetcher(url)
+            children, models, metadata, target = self._parse_database_page(prefix, document, identity)
+            self._cache_database_page(prefix, children, models, metadata)
+            # return only the exact requested row
+            if target is not None:
+                return target
+            # stop when the page does not delegate this identity
+            if length == 6 or next_prefix not in children:
+                return {}
+        return {}
+
+    # preserve the model-only compatibility helper used by source proof
+    def _resolve_static_model(self, identity: str, fetch_budget: list[int]) -> str | None:
+        return self._resolve_static_aircraft(identity, fetch_budget).get("model")
+
+    # load one bounded pinned type-description table on demand
+    def _load_type_names(self, fetch_budget: list[int]) -> dict[str, str] | None:
+        # reuse one immutable activation's validated table
+        if self._type_name_cache is not None:
+            return self._type_name_cache
+        # keep named metadata inside the shared transport allowance
+        if fetch_budget[0] <= 0:
+            return None
+        fetch_budget[0] -= 1
+        url = f"http://127.0.0.1:8078/{self.database_directory}/icao_aircraft_types2.js"
+        document = self.metadata_fetcher(url)
+        # cap the complete fixed table before retaining selected fields
+        if len(document) > MAX_TYPE_NAMES:
+            raise ValueError("oversized aircraft type table")
+        retained: dict[str, str] = {}
+        # ignore malformed optional rows without invalidating valid descriptions
+        for model, row in document.items():
+            normalized = normalize_aircraft_model(model)
+            type_name = _optional_text(row[0]) if isinstance(row, list) and len(row) == 3 else None
+            # retain only exact normalized keys with one safe description
+            if normalized == model and type_name is not None:
+                retained[model] = type_name
+        self._type_name_cache = retained
+        return retained
+
+    # load one bounded pinned operator-prefix table on demand
+    def _load_operators(self, fetch_budget: list[int]) -> dict[str, str] | None:
+        # reuse one immutable activation's validated table
+        if self._operator_cache is not None:
+            return self._operator_cache
+        # keep named metadata inside the shared transport allowance
+        if fetch_budget[0] <= 0:
+            return None
+        fetch_budget[0] -= 1
+        url = f"http://127.0.0.1:8078/{self.database_directory}/operators.js"
+        document = self.metadata_fetcher(url)
+        # cap the complete fixed table while allowing known nonprefix rows
+        if len(document) > MAX_OPERATOR_PREFIXES:
+            raise ValueError("oversized operator table")
+        retained: dict[str, str] = {}
+        # ignore nonprefix and malformed optional rows independently
+        for prefix, row in document.items():
+            # skip unsupported operator key shapes
+            if OPERATOR_PREFIX_PATTERN.fullmatch(prefix) is None or not isinstance(row, dict):
+                continue
+            name = _optional_text(row.get("n")) if frozenset(row) == frozenset(("n", "c", "r")) else None
+            # retain only one bounded operator name per exact prefix
+            if name is not None:
+                retained[prefix] = name
+        self._operator_cache = retained
+        return retained
+
+    # resolve one type description through direct or pinned fallback metadata
+    def _type_name_for(self, metadata: dict[str, str], model: str | None, fetch_budget: list[int]) -> str | None:
+        direct = metadata.get("type_name")
+        # prefer the exact aircraft row's description
+        if direct is not None:
+            return direct
+        # fall back only from one validated icao type code
+        if model is None:
+            return None
+        table = self._load_type_names(fetch_budget)
+        return table.get(model) if table is not None else None
+
+    # resolve one physical callsign to a pinned operator name
+    def _airline_for(self, flight: Any, registration: str | None, fetch_budget: list[int]) -> str | None:
+        callsign = _flight(flight)
+        # require the conservative three-letter operator callsign shape
+        if (
+            callsign is None
+            or len(callsign) < 4
+            or OPERATOR_PREFIX_PATTERN.fullmatch(callsign[:3]) is None
+            or re.fullmatch(r"[A-Z]{4}", callsign[:4]) is not None
+        ):
+            return None
+        comparable = callsign.replace("-", "").replace("+", "")
+        registered = registration.replace("-", "").replace("+", "") if registration is not None else None
+        # never label a tail-number callsign as an airline
+        if registered is not None and comparable == registered:
+            return None
+        operators = self._load_operators(fetch_budget)
+        return operators.get(callsign[:3]) if operators is not None else None
 
     # reset only one receiver's proof and progression baseline
-    def _invalidate(self, band: str, now_mono: float) -> dict[str, Any]:
+    def _invalidate(self, band: str, now_mono: float, station: tuple[float, float] | None = None) -> dict[str, Any]:
         self._states.pop(band, None)
         self._bands[band] = {"state": "unknown", "last_message_at": None}
         return {
@@ -191,11 +661,19 @@ class AlertSourceMonitor:
             "coverage_state": "unknown",
             "coverage_since": now_mono,
             "coverage_until": now_mono,
+            "location_center": station,
             "aircraft": [],
         }
 
     # inspect one fixed source generation and its decoded progression
-    def _observe(self, band: str, expected: dict[str, Any], now_wall: float, now_mono: float) -> dict[str, Any]:
+    def _observe(
+        self,
+        band: str,
+        expected: dict[str, Any],
+        now_wall: float,
+        now_mono: float,
+        station: tuple[float, float] | None,
+    ) -> dict[str, Any]:
         directory = self.root / "alert-source" / band
         # reject a replaced publication directory
         if directory.is_symlink():
@@ -233,7 +711,7 @@ class AlertSourceMonitor:
             raise ValueError("invalid input socket")
         started_at = _timestamp(marker.get("started_at"))
         payload = read_json(directory / "aircraft.json")
-        rows = normalize_aircraft(payload, now=now_wall, band=band)
+        rows = normalize_aircraft(payload, now=now_wall, band=band, station=station)
         stats = read_json(directory / "stats.json", 128 * 1024)
         total = stats.get("total")
         # require the pinned cumulative accepted-message schema
@@ -364,13 +842,21 @@ class AlertSourceMonitor:
             "coverage_state": "healthy",
             "coverage_since": previous["since"],
             "coverage_until": min(now_mono, previous["until"]),
+            "location_center": station,
             "aircraft": fresh_rows,
         }
 
     # collect bounded independent samples without exposing private runtime configuration
-    def poll(self, *, now_wall: float | None = None, now_mono: float | None = None) -> list[dict[str, Any]]:
+    def poll(
+        self,
+        *,
+        now_wall: float | None = None,
+        now_mono: float | None = None,
+        resolve_models: bool = False,
+    ) -> list[dict[str, Any]]:
         wall = time.time() if now_wall is None else now_wall
         mono = time.monotonic() if now_mono is None else now_mono
+        station = self._station_position()
         # discard continuity across poll gaps or wall-clock adjustments
         if self._last_poll is not None:
             old_wall, old_mono = self._last_poll
@@ -397,23 +883,38 @@ class AlertSourceMonitor:
             # invalidate all prior generations after immutable activation changes
             if identity != (self.activation_id, self.contract_digest):
                 self._states.clear()
+                self._database_pages.clear()
+                self._model_cache.clear()
+                self._aircraft_metadata_cache.clear()
+                self._aircraft_cache_completeness.clear()
+                self._operator_cache = None
+                self._type_name_cache = None
+                self._model_cursor = 0
             self.activation_id, self.contract_digest = identity
         except (OSError, ValueError, TypeError, OverflowError, RecursionError):
-            return [self._invalidate(band, mono) for band in ("1090", "978")]
+            return [self._invalidate(band, mono, station) for band in ("1090", "978")]
         samples = []
         # keep removed bands explicitly unknown so persisted obligations cannot shrink
         for band in ("1090", "978"):
             expected = alerts["sources"].get(band)
             # absent hardware cannot prove an encounter's required absence
             if band not in alerts["expected_bands"] or not isinstance(expected, dict):
-                samples.append({**self._invalidate(band, mono), "expected": False})
+                samples.append({**self._invalidate(band, mono, station), "expected": False})
                 self._bands[band]["state"] = "absent"
                 continue
             try:
-                samples.append(self._observe(band, expected, wall, mono))
+                samples.append(self._observe(band, expected, wall, mono, station))
             except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
-                samples.append({**self._invalidate(band, mono), "expected": True})
-        candidates = {row["hex"]: row for sample in samples for row in sample["aircraft"]}
+                samples.append({**self._invalidate(band, mono, station), "expected": True})
+        observations: dict[str, list[dict[str, Any]]] = {}
+        # index only already-proven physical rows for optional metadata joins
+        for sample in samples:
+            # retain every independently received band row
+            for row in sample["aircraft"]:
+                observations.setdefault(row["hex"], []).append(row)
+        candidates = {identity: rows[-1] for identity, rows in observations.items()}
+        models: dict[str, str] = {}
+        invalid_map_models = False
         # enrich only already-proven physical sightings from the optional pinned map database
         if candidates:
             try:
@@ -423,8 +924,9 @@ class AlertSourceMonitor:
                 # bound the optional map join without treating it as a reception source
                 if not isinstance(metadata, list) or len(metadata) > MAX_ROWS:
                     raise ValueError("invalid enrichment")
-                flags = {}
-                # join only strict known bitfields to physical identities
+                flags: dict[str, int] = {}
+                joined_models: dict[str, str] = {}
+                # join only strict classification metadata to physical identities
                 for row in metadata:
                     if not isinstance(row, dict) or not isinstance(row.get("hex"), str):
                         continue
@@ -433,13 +935,70 @@ class AlertSourceMonitor:
                     # ignore malformed or unverified integer flag shapes
                     if hex_id in candidates and type(value) is int and 0 <= value <= 127:
                         flags[hex_id] = value
+                    # validate only model metadata that can affect a physical sighting
+                    if hex_id in candidates and "t" in row:
+                        model = normalize_aircraft_model(row["t"])
+                        # reject malformed or conflicting model joins as one enrichment unit
+                        if model is None or (hex_id in joined_models and joined_models[hex_id] != model):
+                            invalid_map_models = True
+                            raise ValueError("invalid model enrichment")
+                        joined_models[hex_id] = model
                 # apply classification-only data to every overlap observation
                 for sample in samples:
+                    # enrich each proven per-band observation independently
                     for row in sample["aircraft"]:
+                        # attach only a validated matching bitfield
                         if row["hex"] in flags:
                             row["dbFlags"] = flags[row["hex"]]
+                        # propagate only validated exact-identity model joins
+                        if row["hex"] in joined_models:
+                            row["model"] = joined_models[row["hex"]]
+                models = joined_models
             except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
                 pass
+        # fill bounded static metadata only for proven sightings and explicit metadata polls
+        if candidates and resolve_models and not invalid_map_models:
+            identities = sorted(candidates)
+            # rotate the bounded worklist so one deep miss cannot starve later identities
+            if identities:
+                offset = self._model_cursor % len(identities)
+                identities = identities[offset:] + identities[:offset]
+                self._model_cursor = (offset + 1) % len(identities)
+            fetch_budget = [MAX_DATABASE_FETCHES]
+            # resolve and attach each identity inside one shared transport allowance
+            for hex_id in identities:
+                try:
+                    static = self._resolve_static_aircraft(hex_id, fetch_budget)
+                except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+                    continue
+                model = models.get(hex_id) or static.get("model")
+                # preserve a validated map model over its static fallback
+                if model is not None:
+                    models[hex_id] = model
+                try:
+                    type_name = self._type_name_for(static, model, fetch_budget)
+                except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+                    type_name = None
+                # attach one exact identity's metadata to every physical band row
+                for row in observations[hex_id]:
+                    # attach one validated model projection
+                    if model is not None:
+                        row["model"] = model
+                    # attach one validated long type projection
+                    if type_name is not None:
+                        row["type_name"] = type_name
+                    try:
+                        airline = self._airline_for(row.get("_flight"), static.get("registration"), fetch_budget)
+                    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+                        airline = None
+                    # attach only a pinned operator lookup result
+                    if airline is not None:
+                        row["airline"] = airline
+        # remove the physical callsign work field before returning normalized samples
+        for rows in observations.values():
+            # clean every independently received band row
+            for row in rows:
+                row.pop("_flight", None)
         return samples
 
     # project only bounded nonsecret worker source status

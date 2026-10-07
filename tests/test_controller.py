@@ -101,6 +101,22 @@ class ControllerTests(unittest.TestCase):
         health = (root / "deploy/alerts/source-health.sh").read_bytes()
         proof["native978"]["existing_host_http_endpoint"] = "http://127.0.0.1:8978/skyaware978/data/aircraft.json"
         validate_source_proof(proof, images, health, 10684)
+        # activation must prove the full combined aircraft and model watchlist
+        for field, count in (
+            ("override_count", 1999),
+            ("model_override_count", 999),
+            ("model_cache_entries", 4095),
+            ("aircraft_metadata_entries", 4095),
+            ("aircraft_cache_completeness_entries", 4095),
+            ("type_name_entries", 3999),
+            ("operator_entries", 6999),
+            ("aircraft_body_bytes", 1023),
+            ("model_cache_pages", 31),
+        ):
+            invalid = json.loads(json.dumps(proof))
+            invalid["worker"][field] = count
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_source_proof(invalid, images, health, 10684)
         failures = [
             ("sources", None),
             ("native978", None),

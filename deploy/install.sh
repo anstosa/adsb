@@ -9,38 +9,130 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 
 SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-ADMIN_ENV=${1:?provide the private admin environment file}
+INSTALL_MODE=install
+ADMIN_ENV=""
+# accept only one documented installer mode
+if [[ $# -eq 1 && $1 == --update ]]; then
+    INSTALL_MODE=update
+    ADMIN_ENV=/etc/adsb/admin.env
+elif [[ $# -eq 1 && $1 == --recover-only ]]; then
+    INSTALL_MODE=recover
+elif [[ $# -eq 1 && $1 != --* ]]; then
+    ADMIN_ENV=$1
+else
+    printf '%s\n' 'usage: install.sh ADMIN_ENV | --update | --recover-only' >&2
+    exit 64
+fi
 
-# validate the supplied secret source without printing its contents
+# load fixed transaction and recovery operations before taking the global lock
+# shellcheck source=deploy/release-transaction.sh
+source "$SOURCE_DIR/deploy/release-transaction.sh"
+
+# skip only a validated live activation when systemd starts boot recovery
+if [[ "$INSTALL_MODE" == recover && ${ADSB_BOOT_RECOVERY:-0} == 1 ]]; then
+    if prepare_activation_lock "" nonblocking; then
+        :
+    else
+        lock_status=$?
+        # only explicit lock contention permits dependency startup
+        if [[ "$lock_status" == 75 ]]; then
+            exit 0
+        fi
+        exit "$lock_status"
+    fi
+else
+    prepare_activation_lock
+fi
+
+# finish any durable interrupted transaction before accepting new activation work
+recover_activation ""
+# stop after recovery when invoked by the boot recovery unit
+if [[ "$INSTALL_MODE" == recover ]]; then
+    exit 0
+fi
+
+# reject a stale staged update after recovery while still holding the activation lock
+if [[ "$INSTALL_MODE" == update ]]; then
+    UPDATE_BASE=${ADSB_UPDATE_BASE_RELEASE:-}
+    if [[ ! "$UPDATE_BASE" =~ ^/opt/adsb/releases/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || \
+        [[ ! -L /opt/adsb/current ]] || [[ $(readlink -f /opt/adsb/current) != "$UPDATE_BASE" ]]; then
+        printf '%s\n' 'automatic update base release changed; rediscovery is required' >&2
+        exit 1
+    fi
+fi
+
+# validate the selected secret source without printing its contents
 if [[ ! -s "$ADMIN_ENV" ]] || ! grep -q '^ADSB_ADMIN_PASSWORD_HASH=' "$ADMIN_ENV"; then
     printf '%s\n' 'admin environment must contain a password hash' >&2
     exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install --no-install-recommends -y docker.io docker-compose-v2 python3 ca-certificates curl unattended-upgrades age
-systemctl enable --now docker
-
-# use a dedicated unprivileged web account without Docker group membership
-if ! id adsb >/dev/null 2>&1; then
-    useradd --system --home-dir /var/lib/adsb --shell /usr/sbin/nologin adsb
+# reject an automatic update when the installed bootstrap contract is incomplete
+if [[ "$INSTALL_MODE" == update ]]; then
+    REQUIRED_UPDATE_COMMANDS=(docker flock install python3 systemctl systemd-analyze tar)
+    # require every command used by immutable staging and activation
+    for command in "${REQUIRED_UPDATE_COMMANDS[@]}"; do
+        command -v "$command" >/dev/null || {
+            printf '%s\n' "automatic update prerequisite is missing: $command" >&2
+            exit 1
+        }
+    done
+    # require the existing dedicated account and fixed verifier
+    if ! id adsb >/dev/null 2>&1 || [[ ! -x /usr/sbin/visudo ]]; then
+        printf '%s\n' 'automatic update bootstrap is incomplete' >&2
+        exit 1
+    fi
+    REQUIRED_UPDATE_DIRECTORIES=(
+        /opt/adsb/releases
+        /opt/adsb/map-ui-releases
+        /var/lib/adsb/config
+        /var/lib/adsb/alerts
+        /var/lib/adsb/alert-source/1090
+        /var/lib/adsb/alert-source/978
+        /var/lib/adsb/runtime
+        /var/lib/adsb/status
+    )
+    # require all persistent directories before creating a candidate release
+    for directory in "${REQUIRED_UPDATE_DIRECTORIES[@]}"; do
+        if [[ ! -d "$directory" || -L "$directory" ]]; then
+            printf '%s\n' "automatic update directory is invalid: $directory" >&2
+            exit 1
+        fi
+    done
+    # require the already bootstrapped container daemon
+    if ! systemctl is-active --quiet docker.service; then
+        printf '%s\n' 'automatic update requires the active Docker service' >&2
+        exit 1
+    fi
 fi
-# remove any pre-existing supplementary privilege groups from the dedicated service account
-usermod -G '' adsb
-install -d -m 755 /opt/adsb /opt/adsb/releases /etc/adsb /var/lib/adsb
-install -d -o adsb -g adsb -m 700 /var/lib/adsb/config
-install -d -o adsb -g adsb -m 700 /var/lib/adsb/alerts
-install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source
-install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source/1090 /var/lib/adsb/alert-source/978
-install -d -o root -g adsb -m 2750 /var/lib/adsb/status
-install -d -m 700 /var/lib/adsb/runtime /var/lib/adsb/cloudflared
-install -d -m 755 /var/lib/adsb/tar1090 /var/lib/adsb/collectd
-install -d -m 700 /var/lib/adsb/piaware
-# restrict status created by an earlier release
-if [[ -e /var/lib/adsb/status/status.json ]]; then
-    chown root:adsb /var/lib/adsb/status/status.json
-    chmod 640 /var/lib/adsb/status/status.json
+
+# bootstrap packages and the service account only during an operator installation
+if [[ "$INSTALL_MODE" == install ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install --no-install-recommends -y docker.io docker-compose-v2 python3 ca-certificates curl unattended-upgrades age
+    systemctl enable --now docker
+
+    # use a dedicated unprivileged web account without Docker group membership
+    if ! id adsb >/dev/null 2>&1; then
+        useradd --system --home-dir /var/lib/adsb --shell /usr/sbin/nologin adsb
+    fi
+    # remove any pre-existing supplementary privilege groups from the dedicated service account
+    usermod -G '' adsb
+    install -d -m 755 /opt/adsb /opt/adsb/releases /etc/adsb /var/lib/adsb
+    install -d -o adsb -g adsb -m 700 /var/lib/adsb/config
+    install -d -o adsb -g adsb -m 700 /var/lib/adsb/alerts
+    install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source
+    install -d -o root -g adsb -m 2750 /var/lib/adsb/alert-source/1090 /var/lib/adsb/alert-source/978
+    install -d -o root -g adsb -m 2750 /var/lib/adsb/status
+    install -d -m 700 /var/lib/adsb/runtime /var/lib/adsb/cloudflared
+    install -d -m 755 /var/lib/adsb/tar1090 /var/lib/adsb/collectd
+    install -d -m 700 /var/lib/adsb/piaware
+    # restrict status created by an earlier release
+    if [[ -e /var/lib/adsb/status/status.json ]]; then
+        chown root:adsb /var/lib/adsb/status/status.json
+        chmod 640 /var/lib/adsb/status/status.json
+    fi
 fi
 
 # stage one exact application tree before changing the selected release
@@ -57,54 +149,20 @@ PREVIOUS_MAP=""
 LEGACY_LAYOUT=false
 TEMP_PATHS=()
 
-# load the isolated pointer and host-file rollback operations
-# shellcheck source=deploy/release-transaction.sh
-source "$SOURCE_DIR/deploy/release-transaction.sh"
-
-# retain prior service activation state for rollback
-ADMIN_WAS_ENABLED=false
-CONTROLLER_WAS_ENABLED=false
-ALERTS_WAS_ENABLED=false
-ADMIN_WAS_ACTIVE=false
-CONTROLLER_WAS_ACTIVE=false
-ALERTS_WAS_ACTIVE=false
+# retain prior unit state for rollback and durable crash recovery
 TIMER_UNITS=(adsb-maintenance.timer apt-daily.timer apt-daily-upgrade.timer)
-declare -A TIMER_WAS_ENABLED TIMER_WAS_ACTIVE
-# record the admin enablement state without failing on a new install
-if systemctl is-enabled --quiet adsb-admin 2>/dev/null; then
-    ADMIN_WAS_ENABLED=true
-fi
-# record the controller enablement state without failing on a new install
-if systemctl is-enabled --quiet adsb-controller 2>/dev/null; then
-    CONTROLLER_WAS_ENABLED=true
-fi
-# record notifier enablement without failing on a first install
-if systemctl is-enabled --quiet adsb-alerts 2>/dev/null; then
-    ALERTS_WAS_ENABLED=true
-fi
-# record the admin process state without failing on a new install
-if systemctl is-active --quiet adsb-admin 2>/dev/null; then
-    ADMIN_WAS_ACTIVE=true
-fi
-# record the controller process state without failing on a new install
-if systemctl is-active --quiet adsb-controller 2>/dev/null; then
-    CONTROLLER_WAS_ACTIVE=true
-fi
-# record notifier process state without failing on a first install
-if systemctl is-active --quiet adsb-alerts 2>/dev/null; then
-    ALERTS_WAS_ACTIVE=true
-fi
-# retain each timer's activation state for a failed installation
-for timer in "${TIMER_UNITS[@]}"; do
-    TIMER_WAS_ENABLED[$timer]=false
-    TIMER_WAS_ACTIVE[$timer]=false
-    # record prior enablement without rejecting an absent new timer
-    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
-        TIMER_WAS_ENABLED[$timer]=true
+declare -A UNIT_WAS_ENABLED UNIT_WAS_ACTIVE
+# record every fixed unit without rejecting a first installation
+for unit in "${ACTIVATION_STATE_UNITS[@]}"; do
+    UNIT_WAS_ENABLED[$unit]=false
+    UNIT_WAS_ACTIVE[$unit]=false
+    # retain prior enablement
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        UNIT_WAS_ENABLED[$unit]=true
     fi
-    # retain the previous running schedule
-    if systemctl is-active --quiet "$timer" 2>/dev/null; then
-        TIMER_WAS_ACTIVE[$timer]=true
+    # retain prior process or schedule activity
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        UNIT_WAS_ACTIVE[$unit]=true
     fi
 done
 
@@ -130,75 +188,38 @@ remove_alert_source_containers() {
 # roll back every selected host artifact when activation fails
 cleanup_install() {
     local exit_code=$?
+    local rollback_failed=false
+    local temporary
     trap - EXIT
     set +e
-    # restore the previous release and integration files after activation begins
+    # replay the durable journal after any activation mutation
     if [[ "$ACTIVATION_STARTED" == true && "$ACTIVATION_COMPLETE" != true ]]; then
-        systemctl stop adsb-alerts 2>/dev/null
-        systemctl stop adsb-controller 2>/dev/null
-        remove_alert_source_containers
-        systemctl stop "${TIMER_UNITS[@]}" 2>/dev/null
-        rollback_activation "" "$ROLLBACK_DIR" "$CURRENT_CODE" "$PREVIOUS_MAP" "$LEGACY_LAYOUT" "$APP_RELEASE" "$MAP_RELEASE"
-        systemctl daemon-reload
-        # restore each timer without enabling work that was previously disabled
-        for timer in "${TIMER_UNITS[@]}"; do
-            # preserve prior enablement while removing new wants links
-            if [[ "${TIMER_WAS_ENABLED[$timer]}" == true ]]; then
-                systemctl enable "$timer"
-            else
-                systemctl disable "$timer" 2>/dev/null
+        # recover only after the durable journal exists
+        if [[ -e /var/lib/adsb/runtime/activation-journal.json || -L /var/lib/adsb/runtime/activation-journal.json ]]; then
+            systemctl stop adsb-alerts.service adsb-controller.service 2>/dev/null
+            remove_alert_source_containers
+            # recover_activation validates then calls rollback_activation
+            # retain all recovery inputs when exact rollback fails
+            if ! recover_activation ""; then
+                rollback_failed=true
+                printf '%s\n' 'activation rollback failed; retained journal and rollback artifacts' >&2
             fi
-            # restart only timers that were already running
-            if [[ "${TIMER_WAS_ACTIVE[$timer]}" == true ]]; then
-                systemctl start "$timer"
-            fi
-        done
-        # restore the prior unit enablement state
-        if [[ "$ADMIN_WAS_ENABLED" == true ]]; then
-            systemctl enable adsb-admin
         else
-            systemctl disable adsb-admin
-        fi
-        # restore the prior controller enablement state
-        if [[ "$CONTROLLER_WAS_ENABLED" == true ]]; then
-            systemctl enable adsb-controller
-        else
-            systemctl disable adsb-controller
-        fi
-        # restore the prior notifier enablement state
-        if [[ "$ALERTS_WAS_ENABLED" == true ]]; then
-            systemctl enable adsb-alerts
-        else
-            systemctl disable adsb-alerts 2>/dev/null
-        fi
-        # restore the prior admin process state
-        if [[ "$ADMIN_WAS_ACTIVE" == true ]]; then
-            systemctl restart adsb-admin
-        else
-            systemctl stop adsb-admin
-        fi
-        # restore the prior controller process state
-        if [[ "$CONTROLLER_WAS_ACTIVE" == true ]]; then
-            systemctl restart adsb-controller
-        else
-            systemctl stop adsb-controller
-        fi
-        # restart only a notifier that existed and was active before activation
-        if [[ "$ALERTS_WAS_ACTIVE" == true ]]; then
-            systemctl restart adsb-alerts
-        else
-            systemctl stop adsb-alerts 2>/dev/null
+            rm -rf -- "$ROLLBACK_DIR"
         fi
     fi
-    # remove every unselected or failed release
-    if [[ "$ACTIVATION_COMPLETE" != true ]]; then
+    # remove an unselected release when no durable recovery remains
+    if [[ "$ACTIVATION_COMPLETE" != true && "$rollback_failed" != true ]]; then
         rm -rf -- "$APP_RELEASE" "$MAP_RELEASE"
     fi
     # remove staged host files without retaining secret copies
     for temporary in "${TEMP_PATHS[@]}"; do
         rm -f -- "$temporary"
     done
-    rm -rf -- "$ROLLBACK_DIR"
+    # remove pre-journal rollback data only when no recovery failed
+    if [[ "$ACTIVATION_STARTED" != true && "$rollback_failed" != true ]]; then
+        rm -rf -- "$ROLLBACK_DIR"
+    fi
     exit "$exit_code"
 }
 trap cleanup_install EXIT
@@ -354,12 +375,42 @@ SUDOERS_TEMP="/etc/sudoers.d/adsb-stack.$$.next"
 ADMIN_UNIT_TEMP="/etc/systemd/system/adsb-admin.service.$$.next"
 CONTROLLER_UNIT_TEMP="/etc/systemd/system/adsb-controller.service.$$.next"
 ALERTS_UNIT_TEMP="/etc/systemd/system/adsb-alerts.service.$$.next"
-TEMP_PATHS+=("$ADMIN_TEMP" "$RUNTIME_TEMP" "$STACK_TEMP" "$SUDOERS_TEMP" "$ADMIN_UNIT_TEMP" "$CONTROLLER_UNIT_TEMP" "$ALERTS_UNIT_TEMP")
+UPDATER_UNIT_TEMP="/etc/systemd/system/adsb-updater.service.$$.next"
+UPDATER_PATH_TEMP="/etc/systemd/system/adsb-updater.path.$$.next"
+RECOVERY_UNIT_TEMP="/etc/systemd/system/adsb-activation-recovery.service.$$.next"
+DOCKER_GUARD_TEMP="/etc/systemd/system/docker.service.d/20-adsb-recovery.conf.$$.next"
+TEMP_PATHS+=("$ADMIN_TEMP" "$RUNTIME_TEMP" "$STACK_TEMP" "$SUDOERS_TEMP" "$ADMIN_UNIT_TEMP" \
+    "$CONTROLLER_UNIT_TEMP" "$ALERTS_UNIT_TEMP" "$UPDATER_UNIT_TEMP" "$UPDATER_PATH_TEMP" "$RECOVERY_UNIT_TEMP" "$DOCKER_GUARD_TEMP")
 install -o root -g root -m 600 "$ADMIN_ENV" "$ADMIN_TEMP"
 install -o root -g root -m 755 "$APP_RELEASE/deploy/adsb-stack" "$STACK_TEMP"
 install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-admin.service" "$ADMIN_UNIT_TEMP"
 install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-controller.service" "$CONTROLLER_UNIT_TEMP"
 install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-alerts.service" "$ALERTS_UNIT_TEMP"
+install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-updater.service" "$UPDATER_UNIT_TEMP"
+install -o root -g root -m 644 "$APP_RELEASE/deploy/adsb-updater.path" "$UPDATER_PATH_TEMP"
+install -d -o root -g root -m 755 /etc/systemd/system/docker.service.d
+install -o root -g root -m 644 "$APP_RELEASE/deploy/docker-recovery.conf" "$DOCKER_GUARD_TEMP"
+# bind boot recovery to the exact installer that understands this journal schema
+python3 -B - "$APP_RELEASE/deploy/adsb-activation-recovery.service" "$RECOVERY_UNIT_TEMP" \
+    "$APP_RELEASE/deploy/install.sh" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+installer = sys.argv[3]
+recovery_template = source.read_text(encoding="utf-8")
+# replace exactly one reviewed non-shell placeholder
+if recovery_template.count("@ADSB_RECOVERY_INSTALLER@") != 1:
+    raise ValueError("recovery unit template is invalid")
+destination.write_text(
+    recovery_template.replace("@ADSB_RECOVERY_INSTALLER@", installer),
+    encoding="utf-8",
+)
+os.chown(destination, 0, 0)
+os.chmod(destination, 0o644)
+PY
 # prepare weekly maintenance files without modifying active host configuration
 for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
     destination="${artifact%%|*}"
@@ -375,7 +426,8 @@ chmod 440 "$SUDOERS_TEMP"
 /usr/sbin/visudo -cf "$SUDOERS_TEMP"
 systemd-analyze verify "$APP_RELEASE/deploy/adsb-admin.service" "$APP_RELEASE/deploy/adsb-controller.service" \
     "$APP_RELEASE/deploy/adsb-alerts.service" "$APP_RELEASE/deploy/adsb-maintenance.service" \
-    "$APP_RELEASE/deploy/adsb-maintenance.timer"
+    "$APP_RELEASE/deploy/adsb-maintenance.timer" "$APP_RELEASE/deploy/adsb-updater.service" \
+    "$APP_RELEASE/deploy/adsb-updater.path" "$APP_RELEASE/deploy/adsb-activation-recovery.service"
 
 # prepare the next runtime document while preserving the existing tunnel choice
 python3 -B - "$APP_RELEASE" "$RUNTIME_TEMP" "$ACTIVATION_ID" <<'PY'
@@ -402,8 +454,31 @@ PY
 install -d -o root -g root -m 700 "$ROLLBACK_DIR"
 backup_activation_files "" "$ROLLBACK_DIR"
 
-# activate the prepared release and host files under rollback protection
+# persist exact fixed unit states without executable recovery data
+JOURNAL_UNIT_STATES=()
+for unit in "${ACTIVATION_STATE_UNITS[@]}"; do
+    JOURNAL_UNIT_STATES+=("${UNIT_WAS_ENABLED[$unit]}" "${UNIT_WAS_ACTIVE[$unit]}")
+done
+# make rollback files durable before publishing their journal
+sync -f "$ROLLBACK_DIR"
+# route every later failure through durable recovery
 ACTIVATION_STARTED=true
+write_activation_journal "" "$ROLLBACK_DIR" "$CURRENT_CODE" "$PREVIOUS_MAP" "$LEGACY_LAYOUT" \
+    "$APP_RELEASE" "$MAP_RELEASE" "$ACTIVATION_ID" "${JOURNAL_UNIT_STATES[@]}"
+
+# activate the prepared release and host files under rollback protection
+# install boot recovery before selecting the new application pointer
+mv -f "$RECOVERY_UNIT_TEMP" /etc/systemd/system/adsb-activation-recovery.service
+# publish every failure-propagating guard before selecting candidate code
+mv -f "$ADMIN_UNIT_TEMP" /etc/systemd/system/adsb-admin.service
+mv -f "$CONTROLLER_UNIT_TEMP" /etc/systemd/system/adsb-controller.service
+mv -f "$ALERTS_UNIT_TEMP" /etc/systemd/system/adsb-alerts.service
+mv -f "$UPDATER_UNIT_TEMP" /etc/systemd/system/adsb-updater.service
+mv -f "$UPDATER_PATH_TEMP" /etc/systemd/system/adsb-updater.path
+mv -f "$DOCKER_GUARD_TEMP" /etc/systemd/system/docker.service.d/20-adsb-recovery.conf
+sync -f /etc/systemd/system "$APP_RELEASE"
+systemctl daemon-reload
+systemctl enable adsb-activation-recovery.service
 # stop the old worker before changing its immutable release pointer
 worker_load_state=$(systemctl show adsb-alerts.service --property=LoadState --value)
 # a first installation has no existing worker to drain
@@ -418,9 +493,6 @@ mv -f "$ADMIN_TEMP" /etc/adsb/admin.env
 mv -f "$RUNTIME_TEMP" /etc/adsb/runtime.json
 mv -f "$STACK_TEMP" /usr/local/sbin/adsb-stack
 mv -f "$SUDOERS_TEMP" /etc/sudoers.d/adsb-stack
-mv -f "$ADMIN_UNIT_TEMP" /etc/systemd/system/adsb-admin.service
-mv -f "$CONTROLLER_UNIT_TEMP" /etc/systemd/system/adsb-controller.service
-mv -f "$ALERTS_UNIT_TEMP" /etc/systemd/system/adsb-alerts.service
 # select reviewed weekly schedules alongside the application release
 for artifact in "${MAINTENANCE_ARTIFACTS[@]}"; do
     destination="${artifact%%|*}"
@@ -451,7 +523,14 @@ fi
 # enable scheduled work only after application readiness has been verified
 systemctl enable "${TIMER_UNITS[@]}"
 systemctl restart "${TIMER_UNITS[@]}"
+# start update request observation only after application readiness
+systemctl enable adsb-updater.path
+systemctl restart adsb-updater.path
+# flush selected pointers and host integration before committing activation
+sync -f /opt/adsb /etc /var/lib/adsb /usr/local/sbin
+clear_activation_journal ""
 ACTIVATION_COMPLETE=true
+rm -rf -- "$ROLLBACK_DIR"
 
 # remove inactive legacy code only after successful activation
 if [[ "$LEGACY_LAYOUT" == true ]]; then

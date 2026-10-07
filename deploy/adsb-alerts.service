@@ -1,7 +1,8 @@
 [Unit]
 Description=Ballydidean ADS-B aircraft alert worker
-After=network-online.target adsb-controller.service
+After=network-online.target adsb-controller.service adsb-activation-recovery.service
 Wants=network-online.target
+Requires=adsb-activation-recovery.service
 
 [Service]
 Type=simple

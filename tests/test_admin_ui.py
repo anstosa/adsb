@@ -24,7 +24,8 @@ class AdminUiBrowserRegressionTest(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            # allow all serial scenarios while preserving each seven-second guard
+            timeout=300,
         )
         self.assertEqual(
             0,

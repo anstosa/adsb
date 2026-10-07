@@ -2,6 +2,7 @@
 
 const NETWORK_IDS = ["adsbexchange", "flightaware", "adsblol", "airplaneslive"];
 const ALERT_CATEGORIES = ["military", "medical", "news"];
+const ALERT_CHANNELS = ["pushover", "email"];
 const MAX_ALERT_OVERRIDES = 2000;
 const ALERT_SECRET_FIELDS = {
   "pushover.app_token": "alerts-pushover-token",
@@ -11,6 +12,7 @@ const ALERT_SECRET_FIELDS = {
 };
 const ALERT_FIELD_ERROR_IDS = {
   categories: "alerts-categories",
+  category_channels: "alerts-categories",
   "pushover.app_token": "alerts-pushover-token",
   "pushover.user_key": "alerts-pushover-user-key",
   "smtp.host": "alerts-smtp-host",
@@ -42,6 +44,27 @@ const FIELD_ERROR_IDS = {
   "station.longitude": "station-longitude",
   "station.altitude_m": "station-altitude"
 };
+const MAINTENANCE_POLICY = "Clearly compatible updates install automatically; breaking or unknown updates are held for your Install action";
+const UPDATE_COMPATIBILITY_LABELS = {
+  compatible: "Compatible",
+  breaking: "Breaking change",
+  unknown: "Compatibility unknown"
+};
+const UPDATE_STATE_LABELS = {
+  available: "Available",
+  held: "Held for Install action",
+  queued: "Queued",
+  installing: "Installing",
+  installed: "Installed",
+  failed: "Install failed",
+  rolled_back: "Rolled back",
+  blocked: "Blocked"
+};
+const ACTIVE_INSTALLATION_STATES = new Set(["queued", "preparing", "installing"]);
+const TERMINAL_INSTALLATION_STATES = new Set(["installed", "failed", "rolled_back", "rejected"]);
+const INSTALLABLE_UPDATE_STATES = new Set(["available", "held", "failed", "rolled_back"]);
+const OFFICIAL_CHANGELOG_HOSTS = new Set(["github.com", "nginx.org", "docs.nginx.com", "developers.cloudflare.com"]);
+const MAINTENANCE_ID_PATTERN = /^[a-f0-9]{64}$/i;
 
 let csrfToken = "";
 let currentRevision = 0;
@@ -57,8 +80,14 @@ let alertStatusPollCount = 0;
 let alertTestPending = false;
 let alertTestCooldownUntil = 0;
 let alertOverrideSequence = 0;
+let maintenanceReportSnapshot = null;
+let maintenanceRequestSequence = 0;
+let maintenanceCardsRenderKey = "";
 const feederActions = new Map();
 const alertSecretActions = new Map();
+const maintenanceInstallActions = new Map();
+const maintenanceSelectedIds = new Set();
+let maintenanceSelectionGeneration = "";
 
 // find one required element
 function element(id) {
@@ -512,7 +541,7 @@ function renderMaintenanceEmail(value) {
   const state = typeof notification.state === "string" ? notification.state : "unknown";
   const labels = {
     not_configured: "SMTP not configured",
-    waiting: "Waiting for next review",
+    waiting: "Watching for changes",
     pending: "Queued",
     in_flight: "Sending",
     retry: "Retrying",
@@ -532,25 +561,374 @@ function renderMaintenanceEmail(value) {
   element("maintenance-email-notification").textContent = label;
 }
 
+// accept only fixed official changelog destinations
+function safeChangelogUrl(value) {
+  // reject absent or non-string destinations
+  if (typeof value !== "string" || !value) {
+    return "";
+  }
+  // reject ambiguous authority and control characters before parsing
+  if (value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value) || value.includes("\\")) {
+    return "";
+  }
+
+  // parse untrusted report data without navigating
+  try {
+    const url = new URL(value);
+    // require credential-free standard https on one exact allowlisted host
+    if (url.protocol !== "https:" || !OFFICIAL_CHANGELOG_HOSTS.has(url.hostname)
+        || url.username || url.password || (url.port && url.port !== "443")) {
+      return "";
+    }
+    return url.href;
+  } catch (error) {
+    return "";
+  }
+}
+
+// fingerprint only candidate-card inputs that affect rendered interaction
+function maintenanceCardsFingerprint(status, generation, updates, installation) {
+  const candidates = updates.map((update) => [
+    update.id,
+    update.name,
+    update.label,
+    update.current_version,
+    update.candidate_version,
+    update.compatibility,
+    update.state,
+    update.reason,
+    update.changelog,
+    update.changelog_url
+  ]);
+  const actions = Array.from(maintenanceInstallActions.entries())
+    .map(([candidateId, action]) => [candidateId, action.phase, action.sessionGeneration])
+    .sort((left, right) => left[0].localeCompare(right[0]));
+  return JSON.stringify([
+    status,
+    generation,
+    candidates,
+    installation.state,
+    installation.candidate_id,
+    installation.candidate_ids,
+    actions
+  ]);
+}
+
+// map installation progress onto its candidate card
+function effectiveUpdateState(update, installation) {
+  const localAction = maintenanceInstallActions.get(update.id);
+  // preserve an intentional request across stale maintenance polls
+  if (localAction && (localAction.phase === "requesting" || ACTIVE_INSTALLATION_STATES.has(localAction.phase))) {
+    return localAction.phase === "installing" ? "installing" : "queued";
+  }
+
+  // reflect server installation progress before its update list catches up
+  if (installation && installationCandidateIds(installation).includes(update.id)) {
+    // collapse preparation into the bounded queued card state
+    if (["queued", "preparing"].includes(installation.state)) {
+      return "queued";
+    }
+    // accept only states represented by candidate cards
+    if (["installing", "installed", "failed", "rolled_back"].includes(installation.state)) {
+      return installation.state;
+    }
+  }
+  return UPDATE_STATE_LABELS[update.state] ? update.state : "blocked";
+}
+
+// explain the first applicable disabled selection boundary
+function maintenanceSelectionDisabledReason(state, validContract, installable) {
+  // technical blocks take precedence over other selection states
+  if (state === "blocked") {
+    return "This update is technically blocked and cannot be installed.";
+  }
+  // require exact discovery authorization before installation
+  if (!validContract) {
+    return "This update report cannot safely authorize installation.";
+  }
+  // distinguish terminal cards from an active batch
+  if (!installable) {
+    return "This update is not available for installation.";
+  }
+  return "Wait for the current installation request to finish.";
+}
+
+// preserve explicit maintenance headline priority
+function maintenanceHeadline(status, active, updateCount, heldCount) {
+  // unavailable reports cannot establish readiness
+  if (status === "unknown") {
+    return "Report unavailable";
+  }
+  // maintenance failures override candidate summaries
+  if (status === "failed") {
+    return "Maintenance failed";
+  }
+  // keep acknowledged work visible until its exact terminal outcome
+  if (active) {
+    return "Update in progress";
+  }
+  // report non-update attention separately from a current release
+  if (status === "attention" && updateCount === 0) {
+    return "Check needs attention";
+  }
+  // held changes require an explicit selection
+  if (heldCount > 0) {
+    return "Updates held";
+  }
+  // otherwise summarize compatible available changes
+  if (updateCount > 0) {
+    return "Updates available";
+  }
+  return "Maintenance current";
+}
+
+// create one untrusted maintenance update card
+function createMaintenanceUpdateCard(update, generation, installation) {
+  const card = document.createElement("article");
+  const effectiveState = effectiveUpdateState(update, installation);
+  const installationActive = maintenanceInstallActions.size > 0
+    || (installation && ACTIVE_INSTALLATION_STATES.has(installation.state));
+  const compatibility = UPDATE_COMPATIBILITY_LABELS[update.compatibility] ? update.compatibility : "unknown";
+  const label = typeof update.label === "string" && update.label ? update.label : "Unnamed update";
+  card.className = "maintenance-update-card";
+
+  const heading = document.createElement("div");
+  heading.className = "maintenance-update-heading";
+  const selectionLabel = document.createElement("label");
+  selectionLabel.className = "maintenance-update-selection";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  const validContract = MAINTENANCE_ID_PATTERN.test(update.id) && MAINTENANCE_ID_PATTERN.test(generation);
+  const installable = INSTALLABLE_UPDATE_STATES.has(effectiveState);
+  checkbox.dataset.candidateId = update.id;
+  checkbox.checked = maintenanceSelectedIds.has(update.id);
+  checkbox.setAttribute("aria-label", `Select ${label} for installation`);
+  checkbox.disabled = !installable || !validContract || installationActive;
+  // explain read-only selection without removing its header space
+  if (checkbox.disabled) {
+    checkbox.title = maintenanceSelectionDisabledReason(effectiveState, validContract, installable);
+  }
+  selectionLabel.append(checkbox);
+  const title = document.createElement("div");
+  const name = document.createElement("h4");
+  name.textContent = label;
+  const component = document.createElement("small");
+  component.textContent = typeof update.name === "string" ? update.name : "application component";
+  title.append(name, component);
+  const badge = document.createElement("span");
+  badge.className = `maintenance-update-state update-state-${compatibility}`;
+  badge.textContent = `${UPDATE_COMPATIBILITY_LABELS[compatibility]} · ${UPDATE_STATE_LABELS[effectiveState]}`;
+  heading.append(selectionLabel, title, badge);
+  card.append(heading);
+
+  const versions = document.createElement("p");
+  versions.className = "maintenance-update-versions";
+  const currentVersion = typeof update.current_version === "string" && update.current_version ? update.current_version : "unknown";
+  const candidateVersion = typeof update.candidate_version === "string" && update.candidate_version ? update.candidate_version : "unknown";
+  versions.textContent = `${currentVersion} → ${candidateVersion}`;
+  card.append(versions);
+
+  // show the server's plain-text decision rationale
+  if (typeof update.reason === "string" && update.reason) {
+    const reason = document.createElement("p");
+    reason.className = "maintenance-update-reason";
+    reason.textContent = update.reason;
+    card.append(reason);
+  }
+
+  // render changelog text without interpreting markdown or html
+  if (typeof update.changelog === "string" && update.changelog) {
+    const changelog = document.createElement("details");
+    changelog.className = "maintenance-changelog";
+    const summary = document.createElement("summary");
+    summary.textContent = "View changelog";
+    const text = document.createElement("pre");
+    text.textContent = update.changelog;
+    changelog.append(summary, text);
+    card.append(changelog);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "maintenance-update-actions";
+  const changelogUrl = safeChangelogUrl(update.changelog_url);
+  // link only to approved official sources
+  if (changelogUrl) {
+    const link = document.createElement("a");
+    link.className = "maintenance-changelog-link";
+    link.href = changelogUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "Official release notes ↗";
+    actions.append(link);
+  }
+
+  // retain progress beneath each read-only in-flight header
+  if (["queued", "installing"].includes(effectiveState)) {
+    const progress = document.createElement("span");
+    progress.className = "maintenance-update-progress";
+    progress.textContent = effectiveState === "installing" ? "Installation in progress…" : "Installation queued…";
+    actions.append(progress);
+  }
+  // avoid an empty footer after moving selection into the header
+  if (actions.childElementCount > 0) {
+    card.append(actions);
+  }
+  return card;
+}
+
+// show one bounded installation outcome
+function showMaintenanceInstallation(message, kind = "info") {
+  const output = element("maintenance-installation");
+  output.textContent = message;
+  output.className = `maintenance-installation maintenance-installation-${kind}`;
+  output.hidden = !message;
+}
+
+// recover bounded batch membership with legacy singleton support
+function installationCandidateIds(installation) {
+  const ids = Array.isArray(installation.candidate_ids)
+    ? installation.candidate_ids
+    : [installation.candidate_id];
+  return ids.filter((id) => typeof id === "string" && MAINTENANCE_ID_PATTERN.test(id)).slice(0, 7);
+}
+
+// update the shared action without rebuilding cards or losing focus
+function renderMaintenanceSelection() {
+  const installation = maintenanceReportSnapshot && maintenanceReportSnapshot.installation || {};
+  const active = maintenanceInstallActions.size > 0 || ACTIVE_INSTALLATION_STATES.has(installation.state);
+  const requesting = Array.from(maintenanceInstallActions.values()).some((action) => action.phase === "requesting");
+  const count = maintenanceSelectedIds.size;
+  const button = element("maintenance-install-selected");
+  button.disabled = count === 0 || active || !MAINTENANCE_ID_PATTERN.test(maintenanceSelectionGeneration);
+  button.textContent = requesting ? "Queuing selected updates…" : active ? "Installation in progress…" : "Install selected";
+  button.setAttribute("aria-busy", String(requesting));
+  element("maintenance-selection-count").textContent = count > 0
+    ? `${count} update${count === 1 ? "" : "s"} selected`
+    : "No updates selected";
+}
+
+// retain explicit checkbox choices only within their current report
+function handleMaintenanceSelection(event) {
+  const checkbox = event.target.closest('input[type="checkbox"][data-candidate-id]');
+  // ignore disabled controls and non-selection events
+  if (!checkbox || checkbox.disabled) {
+    return;
+  }
+  // record only an explicit user choice
+  if (checkbox.checked) {
+    maintenanceSelectedIds.add(checkbox.dataset.candidateId);
+  } else {
+    maintenanceSelectedIds.delete(checkbox.dataset.candidateId);
+  }
+  renderMaintenanceSelection();
+}
+
+// render server and local batch progress without mistaking an older outcome
+function renderMaintenanceInstallation(report, updates) {
+  const installation = report && report.installation && typeof report.installation === "object"
+    ? report.installation
+    : { state: "idle" };
+  const ids = installationCandidateIds(installation);
+  const candidate = updates.find((update) => update && update.id === ids[0]);
+  const label = ids.length > 1 ? `${ids.length} selected updates`
+    : candidate && typeof candidate.label === "string" ? candidate.label : "update";
+
+  // reconcile only the exact acknowledged request not a previous batch outcome
+  for (const [candidateId, action] of maintenanceInstallActions) {
+    // bind progress to the server-issued identity and selected membership
+    if (!action.requestId || action.requestId !== installation.request_id || !ids.includes(candidateId)) {
+      continue;
+    }
+    // release terminal outcomes for every selected card
+    if (TERMINAL_INSTALLATION_STATES.has(installation.state)) {
+      maintenanceInstallActions.delete(candidateId);
+    } else if (ACTIVE_INSTALLATION_STATES.has(installation.state)) {
+      action.phase = installation.state;
+    }
+  }
+
+  const localActions = Array.from(maintenanceInstallActions.entries())
+    .filter(([, action]) => action.sessionGeneration === alertSessionGeneration);
+  // preserve local acknowledgement when a poll is stale or refers to another request
+  if (localActions.length > 0 && (!localActions[0][1].requestId || localActions[0][1].requestId !== installation.request_id || installation.state === "idle")) {
+    const [candidateId, action] = localActions[0];
+    const localCandidate = updates.find((update) => update && update.id === candidateId);
+    const localLabel = localActions.length > 1 ? `${localActions.length} selected updates`
+      : localCandidate && typeof localCandidate.label === "string" ? localCandidate.label : "update";
+    showMaintenanceInstallation(action.phase === "requesting"
+      ? `Requesting installation for ${localLabel}…`
+      : `${localLabel} queued. Installation has not been reported complete.`, "info");
+    return;
+  }
+
+  const labels = {
+    queued: `${label} queued. Installation has not been reported complete.`,
+    preparing: `${label}: preparing to install.`,
+    installing: `${label}: installing.`,
+    installed: `${label}: installed successfully.`,
+    failed: `${label}: installation failed. Review the message and retry when ready.`,
+    rolled_back: `${label}: rolled back. The previous release remains active.`,
+    rejected: `${label}: installation rejected. Refresh the report before retrying.`
+  };
+  const message = typeof installation.message === "string" && installation.message
+    ? installation.message
+    : labels[installation.state] || "";
+  const kind = installation.state === "installed"
+    ? "success"
+    : ["failed", "rolled_back", "rejected"].includes(installation.state)
+      ? "error"
+      : "info";
+  showMaintenanceInstallation(message, kind);
+}
+
 // render the bounded weekly maintenance report
 function renderMaintenance(report) {
+  maintenanceReportSnapshot = report;
   const status = report && ["ok", "attention", "failed"].includes(report.status) ? report.status : "unknown";
+  const updates = report && Array.isArray(report.updates) ? report.updates.filter((update) => update && typeof update === "object") : [];
+  const installation = report && report.installation && typeof report.installation === "object" ? report.installation : { state: "idle" };
+  const generation = report && typeof report.generation === "string" ? report.generation : "";
+  let changedAuthorization = false;
+  // discard local actions whose exact discovery snapshot is no longer displayed
+  for (const [candidateId, action] of maintenanceInstallActions) {
+    // retain uncertainty when the latest report itself is unavailable
+    if (MAINTENANCE_ID_PATTERN.test(generation) && action.generation !== generation) {
+      maintenanceInstallActions.delete(candidateId);
+      changedAuthorization = true;
+    }
+  }
+  // invalidate every selection when its discovery authorization changes
+  if (generation !== maintenanceSelectionGeneration) {
+    maintenanceSelectedIds.clear();
+    maintenanceSelectionGeneration = generation;
+  }
+  renderMaintenanceInstallation(report, updates);
+  // discard members that disappeared or reached a non-retryable terminal state
+  for (const candidateId of maintenanceSelectedIds) {
+    const update = updates.find((row) => row.id === candidateId);
+    // keep selected members visible in progress until their exact outcome arrives
+    if (!update || ![...INSTALLABLE_UPDATE_STATES, "queued", "installing"].includes(effectiveUpdateState(update, installation))) {
+      maintenanceSelectedIds.delete(candidateId);
+    }
+  }
+  renderMaintenanceSelection();
+  // do not imply success when a newer discovery hides an earlier outcome
+  if (changedAuthorization && installation.state === "idle") {
+    showMaintenanceInstallation("Update details changed. The earlier installation outcome is not confirmed; use the refreshed report.", "info");
+  }
+  const heldCount = updates.filter((update) => update.compatibility !== "compatible"
+    && !["queued", "installing", "installed"].includes(effectiveUpdateState(update, installation))).length;
+  const automaticCount = updates.filter((update) => update.compatibility === "compatible"
+    && !["queued", "installing", "installed"].includes(effectiveUpdateState(update, installation))).length;
+  const activeInstallation = ACTIVE_INSTALLATION_STATES.has(installation.state) || maintenanceInstallActions.size > 0;
   const state = element("maintenance-state");
-  state.className = `maintenance-state maintenance-${status === "failed" ? "attention" : status}`;
-  state.textContent = status === "ok"
-    ? "Review current"
-    : status === "attention"
-      ? "Review needed"
-      : status === "failed"
-        ? "Review failed"
-        : "Report unavailable";
+  state.className = `maintenance-state maintenance-${status === "failed" || heldCount > 0 ? "attention" : status}`;
+  state.textContent = maintenanceHeadline(status, activeInstallation, updates.length, heldCount);
   element("maintenance-updated").textContent = formatTimestamp(report && report.updated_at);
   element("maintenance-schedule").textContent = report && report.os_schedule
     ? report.os_schedule
     : "Tuesdays 04:00 America/Los_Angeles";
-  element("maintenance-policy").textContent = report && report.application_policy
-    ? report.application_policy
-    : "Pinned releases; updates require review";
+  element("maintenance-policy").textContent = MAINTENANCE_POLICY;
   element("maintenance-disk").textContent = report && typeof report.disk_free_percent === "number"
     ? `${report.disk_free_percent.toFixed(1)}%`
     : "—";
@@ -560,34 +938,143 @@ function renderMaintenance(report) {
       ? "Not required"
       : "Unknown";
 
-  const images = report && Array.isArray(report.images) ? report.images : [];
-  let imageReviews = 0;
-  // count only reviewed container updates
-  for (const image of images) {
-    // ignore current or unknown image records
-    if (image && image.status === "review") {
-      imageReviews += 1;
-    }
-  }
-  const mapReview = report && report.map_status === "review";
-  // summarize only server-reviewed release results
+  // summarize only the bounded candidate collection
   if (status === "unknown") {
     element("maintenance-releases").textContent = "Unknown";
     element("maintenance-summary").textContent = "No completed maintenance report has been received.";
+  } else if (status === "failed") {
+    element("maintenance-releases").textContent = updates.length > 0 ? `${updates.length} reported` : "Unknown";
+    element("maintenance-summary").textContent = "The latest maintenance run failed and needs operator attention.";
+  } else if (updates.length === 0) {
+    // avoid claiming current when legacy or incomplete detail still needs attention
+    if (status === "attention") {
+      element("maintenance-releases").textContent = "Update details unavailable";
+      element("maintenance-summary").textContent = "Application update details are unavailable and the latest check needs attention.";
+    } else {
+      element("maintenance-releases").textContent = "No updates pending";
+      element("maintenance-summary").textContent = "No application updates are pending. Compatible updates continue to install automatically when found.";
+    }
   } else {
-    const reviewCount = imageReviews + (mapReview ? 1 : 0);
-    element("maintenance-releases").textContent = status === "failed"
-      ? "Unknown"
-      : reviewCount > 0
-        ? `${reviewCount} item${reviewCount === 1 ? "" : "s"} need review`
-        : "No reviewed updates pending";
-    element("maintenance-summary").textContent = status === "ok"
-      ? "The latest Tuesday review completed without an item requiring attention."
-      : status === "failed"
-        ? "The latest Tuesday review failed and needs operator attention."
-        : "The latest Tuesday review found an item that needs operator attention.";
+    const automaticLabel = `${automaticCount} automatic`;
+    const heldLabel = `${heldCount} held`;
+    element("maintenance-releases").textContent = `${automaticLabel} · ${heldLabel}`;
+    element("maintenance-summary").textContent = heldCount > 0
+      ? `${heldCount} breaking or compatibility-unknown update${heldCount === 1 ? " is" : "s are"} held for your explicit Install action. Clearly compatible updates install automatically.`
+      : `${automaticCount} clearly compatible update${automaticCount === 1 ? " is" : "s are"} available for automatic installation.`;
+  }
+
+  const list = element("maintenance-update-list");
+  const cardsRenderKey = maintenanceCardsFingerprint(status, generation, updates, installation);
+  // preserve expanded changelogs and focus across semantically unchanged polls
+  if (cardsRenderKey !== maintenanceCardsRenderKey) {
+    maintenanceCardsRenderKey = cardsRenderKey;
+    list.replaceChildren();
+    // render each candidate without injecting report markup
+    for (const update of updates) {
+      list.append(createMaintenanceUpdateCard(update, generation, installation));
+    }
+    // retain an explicit empty state
+    if (updates.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = ["unknown", "attention"].includes(status)
+        ? "Update information is unavailable."
+        : "No application updates are pending.";
+      list.append(empty);
+    }
   }
   renderMaintenanceEmail(report && report.email_notifications);
+}
+
+// authorize all selected exact versions as one installation transaction
+async function handleMaintenanceInstall() {
+  const report = maintenanceReportSnapshot;
+  const generation = report && typeof report.generation === "string" ? report.generation : "";
+  const candidateIds = Array.from(maintenanceSelectedIds).sort();
+  const updates = report && Array.isArray(report.updates) ? report.updates : [];
+  // reject stale malformed blocked or repeated batch authorization locally
+  if (candidateIds.length === 0 || candidateIds.length > 7 || generation !== maintenanceSelectionGeneration
+      || !MAINTENANCE_ID_PATTERN.test(generation) || maintenanceInstallActions.size > 0
+      || candidateIds.some((id) => !MAINTENANCE_ID_PATTERN.test(id)
+        || !updates.some((update) => update.id === id && INSTALLABLE_UPDATE_STATES.has(effectiveUpdateState(update, report.installation || {}))))
+      || (report.installation && ["queued", "preparing", "installing"].includes(report.installation.state))) {
+    return;
+  }
+
+  const sessionGeneration = alertSessionGeneration;
+  // mark every member before making the single batch request
+  for (const candidateId of candidateIds) {
+    maintenanceInstallActions.set(candidateId, { phase: "requesting", requestId: "", sessionGeneration, generation });
+  }
+  renderMaintenance(report);
+  try {
+    const result = await requestJson("/api/admin/maintenance/install", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ candidate_ids: candidateIds, generation })
+    });
+    // discard completion after any session transition
+    if (sessionGeneration !== alertSessionGeneration) {
+      return;
+    }
+    // acknowledge only the exact batch not a partial or unrelated queue
+    if (result.state !== "queued" || !Array.isArray(result.candidate_ids)
+        || JSON.stringify(result.candidate_ids.slice().sort()) !== JSON.stringify(candidateIds)
+        || typeof result.request_id !== "string" || !result.request_id) {
+      throw new Error("The server did not acknowledge all selected updates as queued.");
+    }
+    const latestReport = maintenanceReportSnapshot || report;
+    // never let delayed acknowledgement restore an older discovery snapshot
+    if (latestReport.generation !== generation) {
+      // remove only the expired authorization's members
+      for (const candidateId of candidateIds) {
+        // leave a replacement generation's newer request intact
+        if (maintenanceInstallActions.get(candidateId)?.generation === generation) {
+          maintenanceInstallActions.delete(candidateId);
+        }
+      }
+      renderMaintenance(latestReport);
+      // do not overwrite progress from a newer intentional batch
+      if (maintenanceInstallActions.size === 0) {
+        showMaintenanceInstallation("Update details changed. The earlier installation outcome is not confirmed; use the refreshed report.", "info");
+      }
+      return;
+    }
+    // retain every queued member until exact root progress confirms an outcome
+    for (const candidateId of candidateIds) {
+      maintenanceInstallActions.set(candidateId, { phase: "queued", requestId: result.request_id, sessionGeneration, generation });
+    }
+    renderMaintenance(latestReport);
+  } catch (error) {
+    // ignore failures after any session transition
+    if (sessionGeneration !== alertSessionGeneration) {
+      return;
+    }
+    // release the entire failed request without implying partial installation
+    for (const candidateId of candidateIds) {
+      // leave a newer request for the same candidate intact
+      if (maintenanceInstallActions.get(candidateId)?.generation === generation) {
+        maintenanceInstallActions.delete(candidateId);
+      }
+    }
+    renderMaintenance(maintenanceReportSnapshot || report);
+    // hand off expired sessions
+    if (handleAuthenticationError(error)) {
+      return;
+    }
+    // a stale rejection cannot replace a newer batch's progress or error
+    if (maintenanceReportSnapshot?.generation !== generation) {
+      return;
+    }
+    // distinguish stale reports and unavailable installers without claiming success
+    if (error.status === 409) {
+      showMaintenanceInstallation("Update information changed before installation was queued. Wait for the next maintenance refresh, then try again.", "error");
+    } else if (error.status === 503) {
+      showMaintenanceInstallation("The installation service is unavailable. Nothing was reported installed; try again.", "error");
+    } else {
+      showMaintenanceInstallation(error.message || "Unable to queue selected updates. Nothing was reported installed.", "error");
+    }
+  }
 }
 
 // summarize hardware without inventing reception
@@ -641,16 +1128,18 @@ function renderStatus(status) {
 // refresh the latest weekly maintenance result
 async function loadMaintenance() {
   const sessionGeneration = alertSessionGeneration;
+  const requestSequence = maintenanceRequestSequence + 1;
+  maintenanceRequestSequence = requestSequence;
   try {
     const report = await requestJson("/api/admin/maintenance");
-    // discard a response from a session that has since ended
-    if (sessionGeneration !== alertSessionGeneration) {
+    // discard a response from an ended session or superseded poll
+    if (sessionGeneration !== alertSessionGeneration || requestSequence !== maintenanceRequestSequence) {
       return;
     }
     renderMaintenance(report);
   } catch (error) {
-    // ignore a failure from a session that has since ended
-    if (sessionGeneration !== alertSessionGeneration) {
+    // ignore a failure from an ended session or superseded poll
+    if (sessionGeneration !== alertSessionGeneration || requestSequence !== maintenanceRequestSequence) {
       return;
     }
     // hand off expired sessions
@@ -1043,7 +1532,13 @@ function clearAlertSessionState() {
   alertTestPending = false;
   alertTestCooldownUntil = 0;
   alertOverrideSequence = 0;
+  maintenanceReportSnapshot = null;
+  maintenanceRequestSequence += 1;
   alertSecretActions.clear();
+  maintenanceInstallActions.clear();
+  maintenanceSelectedIds.clear();
+  maintenanceSelectionGeneration = "";
+  renderMaintenanceSelection();
 
   // clear every secret field without retaining browser values
   for (const inputId of Object.values(ALERT_SECRET_FIELDS)) {
@@ -1055,6 +1550,8 @@ function clearAlertSessionState() {
   element("alerts-override-list").replaceChildren();
   element("alerts-history-list").replaceChildren();
   element("alerts-test-results").replaceChildren();
+  element("maintenance-update-list").replaceChildren();
+  showMaintenanceInstallation("");
   // restore controls without waiting for stale request cleanup
   element("login-button").disabled = false;
   element("login-button").textContent = "Sign in";
@@ -1351,13 +1848,20 @@ function renderAlertConfig(configValue, force = false) {
   const pushover = alertObject(config.pushover);
   const smtp = alertObject(config.smtp);
   const categories = Array.isArray(config.categories) ? config.categories : ALERT_CATEGORIES;
+  const categoryChannels = alertObject(config.category_channels);
   alertRevision = Number.isInteger(config.revision) ? config.revision : 0;
   element("alerts-revision-label").textContent = `Revision ${alertRevision}`;
   element("alerts-enabled").checked = config.enabled === true;
 
-  // restore every fixed category with an all-selected default
+  // preserve legacy delivery choices until per-type routes are saved
   for (const category of ALERT_CATEGORIES) {
-    element(`alerts-category-${category}`).checked = categories.includes(category);
+    const channels = Array.isArray(categoryChannels[category])
+      ? categoryChannels[category]
+      : categories.includes(category) ? ALERT_CHANNELS : [];
+    // restore each independent delivery choice
+    for (const channel of ALERT_CHANNELS) {
+      element(`alerts-category-${category}-${channel}`).checked = channels.includes(channel);
+    }
   }
 
   renderAlertSecret("pushover.app_token", pushover.app_token_configured === true);
@@ -1396,23 +1900,26 @@ function createAlertLabel(controlId, text) {
   return label;
 }
 
-// create one editable exact-aircraft override row
+// create one editable aircraft or model override row
 function createAlertOverrideRow(value, index) {
   const override = alertObject(value);
+  const matchKind = typeof override.model === "string" ? "model" : "hex";
+  const matchLabel = matchKind === "model" ? "Model" : "Aircraft";
   const controlKey = alertOverrideSequence;
   alertOverrideSequence += 1;
   const row = document.createElement("article");
   row.className = "override-row";
+  row.dataset.matchKind = matchKind;
 
   const header = document.createElement("div");
   header.className = "override-row-heading";
   const title = document.createElement("strong");
-  title.textContent = `Aircraft ${index + 1}`;
+  title.textContent = `${matchLabel} ${index + 1}`;
   const remove = document.createElement("button");
   remove.className = "text-button override-remove";
   remove.type = "button";
   remove.textContent = "Remove";
-  remove.setAttribute("aria-label", `Remove aircraft ${index + 1}`);
+  remove.setAttribute("aria-label", `Remove ${matchLabel.toLowerCase()} ${index + 1}`);
   // remove only the selected draft row
   remove.addEventListener("click", () => {
     row.remove();
@@ -1423,20 +1930,29 @@ function createAlertOverrideRow(value, index) {
 
   const grid = document.createElement("div");
   grid.className = "override-grid";
-  const hexField = document.createElement("div");
-  hexField.className = "field";
-  const hexId = `alerts-override-${controlKey}-hex`;
-  const hexInput = document.createElement("input");
-  hexInput.id = hexId;
-  hexInput.className = "override-hex";
-  hexInput.type = "text";
-  hexInput.maxLength = 6;
-  hexInput.pattern = "[A-Fa-f0-9]{6}";
-  hexInput.autocomplete = "off";
-  hexInput.spellcheck = false;
-  hexInput.placeholder = "A1B2C3";
-  hexInput.value = typeof override.hex === "string" ? override.hex.toUpperCase() : "";
-  hexField.append(createAlertLabel(hexId, "ICAO hex"), hexInput);
+  const matchField = document.createElement("div");
+  matchField.className = "field";
+  const matchId = `alerts-override-${controlKey}-${matchKind}`;
+  const matchInput = document.createElement("input");
+  matchInput.id = matchId;
+  matchInput.className = matchKind === "model" ? "override-model" : "override-hex";
+  matchInput.type = "text";
+  matchInput.maxLength = matchKind === "model" ? 4 : 6;
+  matchInput.pattern = matchKind === "model" ? "[A-Za-z0-9]{2,4}" : "[A-Fa-f0-9]{6}";
+  matchInput.autocomplete = "off";
+  matchInput.spellcheck = false;
+  matchInput.placeholder = matchKind === "model" ? "C17" : "A1B2C3";
+  matchInput.value = typeof override[matchKind] === "string" ? override[matchKind].toUpperCase() : "";
+  const matchError = document.createElement("small");
+  matchError.id = `${matchId}-error`;
+  matchError.className = "input-error override-field-error";
+  matchError.hidden = true;
+  matchInput.setAttribute("aria-describedby", matchError.id);
+  matchField.append(
+    createAlertLabel(matchId, matchKind === "model" ? "ICAO model code" : "ICAO hex"),
+    matchInput,
+    matchError
+  );
 
   const modeField = document.createElement("div");
   modeField.className = "field";
@@ -1465,7 +1981,7 @@ function createAlertOverrideRow(value, index) {
   labelInput.placeholder = "Optional private label";
   labelInput.value = typeof override.label === "string" ? override.label : "";
   labelField.append(createAlertLabel(labelId, "Label"), labelInput);
-  grid.append(hexField, modeField, labelField);
+  grid.append(matchField, modeField, labelField);
 
   const categoryGroup = document.createElement("fieldset");
   categoryGroup.className = "override-categories";
@@ -1494,7 +2010,7 @@ function createAlertOverrideRow(value, index) {
   return row;
 }
 
-// redraw all exact-aircraft override rows
+// redraw all aircraft and model override rows
 function renderAlertOverrides(overrides) {
   const list = element("alerts-override-list");
   list.replaceChildren();
@@ -1513,6 +2029,7 @@ function renderAlertOverrides(overrides) {
 function updateAlertOverrideControls() {
   const count = element("alerts-override-list").querySelectorAll(".override-row").length;
   element("alerts-add-override").disabled = count >= MAX_ALERT_OVERRIDES;
+  element("alerts-add-model-override").disabled = count >= MAX_ALERT_OVERRIDES;
 }
 
 // keep override headings and input ids aligned after removal
@@ -1521,16 +2038,20 @@ function renumberAlertOverrides() {
 
   // update visible row positions without changing entered values
   for (let index = 0; index < rows.length; index += 1) {
-    rows[index].querySelector(".override-row-heading strong").textContent = `Aircraft ${index + 1}`;
-    rows[index].querySelector(".override-remove").setAttribute("aria-label", `Remove aircraft ${index + 1}`);
+    const matchLabel = rows[index].dataset.matchKind === "model" ? "Model" : "Aircraft";
+    rows[index].querySelector(".override-row-heading strong").textContent = `${matchLabel} ${index + 1}`;
+    rows[index].querySelector(".override-remove").setAttribute(
+      "aria-label",
+      `Remove ${matchLabel.toLowerCase()} ${index + 1}`
+    );
   }
 
   element("alerts-overrides-empty").hidden = rows.length > 0;
   updateAlertOverrideControls();
 }
 
-// add one blank exact-aircraft override
-function handleAddAlertOverride() {
+// add one blank aircraft or model override
+function handleAddAlertOverride(matchKind) {
   const list = element("alerts-override-list");
   const index = list.querySelectorAll(".override-row").length;
   // refuse rows beyond the validated backend limit
@@ -1538,11 +2059,12 @@ function handleAddAlertOverride() {
     return;
   }
 
-  list.append(createAlertOverrideRow({ mode: "include", categories: ["military"] }, index));
+  const identity = matchKind === "model" ? { model: "" } : { hex: "" };
+  list.append(createAlertOverrideRow({ ...identity, mode: "include", categories: ["military"] }, index));
   element("alerts-overrides-empty").hidden = true;
   updateAlertOverrideControls();
   markAlertConfigDirty();
-  list.lastElementChild.querySelector(".override-hex").focus();
+  list.lastElementChild.querySelector(matchKind === "model" ? ".override-model" : ".override-hex").focus();
 }
 
 // refresh one secret marker from its draft action
@@ -1626,6 +2148,16 @@ function clearAlertFieldErrors() {
     }
   }
 
+  // clear indexed aircraft and model validation
+  for (const input of element("alerts-override-list").querySelectorAll("[aria-invalid='true']")) {
+    input.removeAttribute("aria-invalid");
+  }
+  // clear indexed override messages
+  for (const output of element("alerts-override-list").querySelectorAll(".override-field-error")) {
+    output.textContent = "";
+    output.hidden = true;
+  }
+
   element("alerts-form-error").textContent = "";
   element("alerts-form-error").hidden = true;
 }
@@ -1640,7 +2172,21 @@ function renderAlertFieldErrors(fields) {
     const message = fieldMessage(rawMessage);
     const normalizedName = fieldName.replace(/^alerts\./, "");
     const inputId = ALERT_FIELD_ERROR_IDS[normalizedName];
+    const overrideMatch = normalizedName.match(/^overrides\.(\d+)\.(hex|model)$/);
     summary.push(message);
+
+    // attach indexed identity errors to the matching draft row
+    if (overrideMatch) {
+      const row = element("alerts-override-list").querySelectorAll(".override-row")[Number(overrideMatch[1])];
+      const input = row ? row.querySelector(`.override-${overrideMatch[2]}`) : null;
+      // expose the server message beside the exact rejected identity
+      if (input) {
+        const output = element(`${input.id}-error`);
+        input.setAttribute("aria-invalid", "true");
+        output.textContent = message;
+        output.hidden = false;
+      }
+    }
 
     // attach known errors to their controls
     if (inputId) {
@@ -1693,50 +2239,66 @@ function alertSecretWillBeConfigured(fieldName) {
 function collectAlertConfig() {
   const form = element("alerts-form");
 
-  // run native email and exact-hex validation first
+  // run native email and identity validation first
   if (!form.checkValidity()) {
     form.reportValidity();
     throw new Error("Correct the highlighted alert fields before saving.");
   }
 
-  const categories = ALERT_CATEGORIES.filter((category) => element(`alerts-category-${category}`).checked);
-  // keep at least one enabled classification role
-  if (categories.length === 0) {
-    element("alerts-categories-error").textContent = "Select at least one aircraft category.";
+  const categoryChannels = {};
+  // collect independent delivery routes for every fixed type
+  for (const category of ALERT_CATEGORIES) {
+    // include only checked channels for this type
+    categoryChannels[category] = ALERT_CHANNELS.filter((channel) =>
+      element(`alerts-category-${category}-${channel}`).checked);
+  }
+  // classify only types with an active delivery route
+  const categories = ALERT_CATEGORIES.filter((category) => categoryChannels[category].length > 0);
+  const enabled = element("alerts-enabled").checked;
+  // require a selected delivery route before activation
+  if (enabled && categories.length === 0) {
+    element("alerts-categories-error").textContent = "Select push or email for at least one aircraft type.";
     element("alerts-categories-error").hidden = false;
-    throw new Error("Select at least one aircraft category.");
+    throw new Error("Select push or email for at least one aircraft type.");
   }
 
   const overrides = [];
-  const seenHexes = new Set();
+  const seenIdentities = new Set();
   const rows = element("alerts-override-list").querySelectorAll(".override-row");
-  // collect every bounded exact-aircraft rule
+  // collect every bounded aircraft or model rule
   for (const row of rows) {
-    const hex = row.querySelector(".override-hex").value.trim().toUpperCase();
+    const matchKind = row.dataset.matchKind === "model" ? "model" : "hex";
+    const identity = row.querySelector(`.override-${matchKind}`).value.trim().toUpperCase();
     const mode = row.querySelector(".override-mode").value;
     const label = row.querySelector(".override-label").value.trim();
     const rowCategories = Array.from(row.querySelectorAll(".override-category:checked"), (input) => input.value);
 
-    // enforce exact six-character ICAO identities
-    if (!/^[0-9A-F]{6}$/.test(hex)) {
-      throw new Error("Every override needs an exact six-character hexadecimal ICAO address.");
+    // enforce the exact identity format for this rule
+    if (matchKind === "hex" && !/^[0-9A-F]{6}$/.test(identity)) {
+      throw new Error("Every aircraft override needs an exact six-character hexadecimal ICAO address.");
+    }
+    // accept only bounded ICAO model type codes
+    if (matchKind === "model" && !/^[0-9A-Z]{2,4}$/.test(identity)) {
+      throw new Error("Every model override needs a 2–4 character ICAO model type code.");
     }
 
-    // prevent ambiguous duplicate override rows
-    if (seenHexes.has(hex)) {
-      throw new Error(`ICAO ${hex} appears more than once in the override list.`);
+    const identityKey = `${matchKind}:${identity}`;
+    // prevent ambiguous duplicates within each identity type
+    if (seenIdentities.has(identityKey)) {
+      const identityLabel = matchKind === "model" ? "Model" : "ICAO";
+      throw new Error(`${identityLabel} ${identity} appears more than once in the override list.`);
     }
 
     // keep override categories explicit
     if (rowCategories.length === 0) {
-      throw new Error(`Select at least one category for ICAO ${hex}.`);
+      const identityLabel = matchKind === "model" ? "model" : "ICAO";
+      throw new Error(`Select at least one category for ${identityLabel} ${identity}.`);
     }
 
-    seenHexes.add(hex);
-    overrides.push({ hex, mode, categories: rowCategories, label });
+    seenIdentities.add(identityKey);
+    overrides.push({ [matchKind]: identity, mode, categories: rowCategories, label });
   }
 
-  const enabled = element("alerts-enabled").checked;
   const smtp = {
     host: element("alerts-smtp-host").value.trim(),
     port: Number(element("alerts-smtp-port").value),
@@ -1767,16 +2329,20 @@ function collectAlertConfig() {
     smtp.password = element("alerts-smtp-password").value;
   }
 
-  // explain incomplete dual-channel setup before a round trip
-  if (enabled && (!alertSecretWillBeConfigured("pushover.app_token") || !alertSecretWillBeConfigured("pushover.user_key"))) {
+  const selectedChannels = new Set(Object.values(categoryChannels).flat());
+  // require push credentials only when push is selected
+  if (enabled && selectedChannels.has("pushover") &&
+      (!alertSecretWillBeConfigured("pushover.app_token") || !alertSecretWillBeConfigured("pushover.user_key"))) {
     throw new Error("Configure both Pushover credentials before enabling alerts.");
   }
-  // require the protected smtp destination and credentials together
-  if (enabled && (!smtp.host || !smtp.from_address || !smtp.to_address || !alertSecretWillBeConfigured("smtp.username") || !alertSecretWillBeConfigured("smtp.password"))) {
+  // require smtp credentials only when email is selected
+  if (enabled && selectedChannels.has("email") &&
+      (!smtp.host || !smtp.from_address || !smtp.to_address ||
+       !alertSecretWillBeConfigured("smtp.username") || !alertSecretWillBeConfigured("smtp.password"))) {
     throw new Error("Configure the SMTP host, credentials, sender and recipient before enabling alerts.");
   }
 
-  return { revision: alertRevision, enabled, categories, pushover, smtp, overrides };
+  return { revision: alertRevision, enabled, categories, category_channels: categoryChannels, pushover, smtp, overrides };
 }
 
 // save isolated alert configuration without touching station settings
@@ -1981,8 +2547,8 @@ function createAlertHistoryEvent(value) {
   channelGrid.className = "history-channels";
   const channels = alertObject(event.channels);
   channelGrid.append(
-    createHistoryChannel("Pushover", channels.pushover),
-    createHistoryChannel("Email", channels.email)
+    createHistoryChannel("Pushover", channels.pushover || { state: "not_selected" }),
+    createHistoryChannel("Email", channels.email || { state: "not_selected" })
   );
   card.append(header, tags, channelGrid);
   return card;
@@ -2158,10 +2724,15 @@ function bindEvents() {
   element("alerts-form").addEventListener("submit", handleAlertSave);
   element("alerts-form").addEventListener("input", markAlertConfigDirty);
   element("alerts-form").addEventListener("change", markAlertConfigDirty);
-  element("alerts-add-override").addEventListener("click", handleAddAlertOverride);
+  // add a blank exact-aircraft rule without an extra passthrough handler
+  element("alerts-add-override").addEventListener("click", () => handleAddAlertOverride("hex"));
+  // add a blank model rule through the same draft operation
+  element("alerts-add-model-override").addEventListener("click", () => handleAddAlertOverride("model"));
   element("alerts-test-button").addEventListener("click", handleAlertTest);
   element("alerts-history-refresh").addEventListener("click", () => loadAlertHistory(true, false));
   element("alerts-history-more").addEventListener("click", () => loadAlertHistory(false, false));
+  element("maintenance-update-list").addEventListener("change", handleMaintenanceSelection);
+  element("maintenance-install-selected").addEventListener("click", handleMaintenanceInstall);
 
   // bind redacted credential actions
   for (const [fieldName, inputId] of Object.entries(ALERT_SECRET_FIELDS)) {

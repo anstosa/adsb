@@ -55,6 +55,10 @@ require_directory /var/lib/adsb/piaware root:root:700
 require_file /etc/systemd/system/adsb-admin.service root:root:644
 require_file /etc/systemd/system/adsb-controller.service root:root:644
 require_file /etc/systemd/system/adsb-alerts.service root:root:644
+require_file /etc/systemd/system/adsb-updater.service root:root:644
+require_file /etc/systemd/system/adsb-updater.path root:root:644
+require_file /etc/systemd/system/adsb-activation-recovery.service root:root:644
+require_file /etc/systemd/system/docker.service.d/20-adsb-recovery.conf root:root:644
 require_file /etc/systemd/system/adsb-maintenance.service root:root:644
 require_file /etc/systemd/system/adsb-maintenance.timer root:root:644
 require_file /etc/systemd/system/apt-daily.timer.d/adsb-weekly.conf root:root:644

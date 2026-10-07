@@ -1,0 +1,31 @@
+[Unit]
+Description=ADS-B claimed application update installer
+After=network-online.target docker.service adsb-activation-recovery.service
+Wants=network-online.target
+Requires=docker.service adsb-activation-recovery.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/adsb/current
+Environment=DOCKER_CONFIG=/run/adsb-updater/docker
+RuntimeDirectory=adsb-updater
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I /opt/adsb/current/adsb_admin/update_worker.py
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+# share one app-data mount so private request claims remain atomic
+ReadWritePaths=/opt/adsb /etc/adsb /etc/apt/apt.conf.d /etc/sudoers.d /etc/systemd/system /usr/local/sbin /var/lib/adsb /run/lock /run/systemd
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
+MemoryMax=256M

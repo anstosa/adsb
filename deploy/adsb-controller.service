@@ -1,7 +1,7 @@
 [Unit]
 Description=ADS-B receiver configuration reconciler
-After=docker.service adsb-admin.service
-Requires=docker.service
+After=docker.service adsb-admin.service adsb-activation-recovery.service
+Requires=docker.service adsb-activation-recovery.service
 Wants=adsb-admin.service
 
 [Service]

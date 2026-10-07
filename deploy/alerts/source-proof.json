@@ -1,6 +1,6 @@
 {
   "dump978_image": "ghcr.io/sdr-enthusiasts/docker-dump978@sha256:84959fa5e7476d210c533b578954cd8e49db5d3944602eef8e40f80ee8af44b2",
-  "generated_at": "2026-10-05T20:21:11Z",
+  "generated_at": "2026-10-07T00:02:19Z",
   "health_sha256": "29e0b9b1e6bc96b3a7512b1ca5f3e2975190fb0605c17fe2e06ce6ebde15c3c8",
   "image": "ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder@sha256:fbf81742db245886ceb9c782fb6a707bc6c90b6822d91a1a094b370722e27484",
   "native978": {
@@ -25,7 +25,7 @@
       "no_position": true,
       "producer_coverage_fields_present": false,
       "readonly_root": true,
-      "rss_kib": 5080,
+      "rss_kib": 4808,
       "skyaware978_sha256": "abee1f68d448e58f395a8c27e84eba5cb0be7dfb63a93899bc4d31b02753efd1",
       "tisb_icao_retained": true,
       "unsupported_counter_progress": true,
@@ -33,21 +33,22 @@
     },
     "selected": false
   },
+  "native_evidence_generated_at": "2026-10-06T20:13:28Z",
   "production_headroom": {
-    "captured_at": "2026-10-05T20:19:37Z",
+    "captured_at": "2026-10-06T23:56:56Z",
     "headroom_passed": true,
     "mem_available_kib_samples": [
-      1116760,
-      1135172,
-      1118816,
-      1144472,
-      1104012
+      1070304,
+      1048788,
+      1049512,
+      1077436,
+      1086768
     ],
-    "minimum_mem_available_kib": 1104012,
+    "minimum_mem_available_kib": 1048788,
     "minimum_residual_requirement_kib": 262144,
     "oom_events_last_24h": 0,
     "planned_incremental_memory_kib": 229376,
-    "residual_after_planned_increment_kib": 874636,
+    "residual_after_planned_increment_kib": 819412,
     "vmstat_swap_in_kib_per_second": [
       0,
       0,
@@ -64,26 +65,26 @@
     ]
   },
   "production_headroom_transient_audit": {
-    "captured_at": "2026-10-05T19:05:55Z",
+    "captured_at": "2026-10-06T21:07:02Z",
     "headroom_passed": false,
     "mem_available_kib_samples": [
-      1026996,
-      1056400,
-      1100928,
-      1091848,
-      1070364
+      1036056,
+      1005392,
+      1030108,
+      1001512,
+      1040440
     ],
-    "minimum_mem_available_kib": 1026996,
+    "minimum_mem_available_kib": 1001512,
     "minimum_residual_requirement_kib": 262144,
     "oom_events_last_24h": 0,
     "planned_incremental_memory_kib": 229376,
-    "residual_after_planned_increment_kib": 797620,
+    "residual_after_planned_increment_kib": 772136,
     "vmstat_swap_in_kib_per_second": [
       0,
+      20,
       0,
       0,
-      0,
-      4
+      0
     ],
     "vmstat_swap_out_kib_per_second": [
       0,
@@ -107,7 +108,7 @@
       "first_tracked_message": 2,
       "fresh_generation_marker": true,
       "healthcheck_invocations": 2,
-      "healthcheck_max_runtime_ms": 152,
+      "healthcheck_max_runtime_ms": 4422,
       "healthcheck_timeout_seconds": 5,
       "kernel_bytes_progress": true,
       "kernel_socket_stable": true,
@@ -115,7 +116,7 @@
       "no_position": true,
       "readonly_root": true,
       "readsb_listening_tcp_ports": [],
-      "rss_kib": 4944,
+      "rss_kib": 4560,
       "source_state_schema": 2,
       "startup_accepted": [
         0,
@@ -138,7 +139,7 @@
       "first_tracked_message": 3,
       "fresh_generation_marker": true,
       "healthcheck_invocations": 2,
-      "healthcheck_max_runtime_ms": 125,
+      "healthcheck_max_runtime_ms": 4811,
       "healthcheck_timeout_seconds": 5,
       "kernel_bytes_progress": true,
       "kernel_socket_stable": true,
@@ -146,7 +147,7 @@
       "no_position": true,
       "readonly_root": true,
       "readsb_listening_tcp_ports": [],
-      "rss_kib": 5064,
+      "rss_kib": 4488,
       "source_state_schema": 2,
       "startup_accepted": [
         0,
@@ -159,10 +160,14 @@
     }
   ],
   "worker": {
+    "aircraft_body_bytes": 1024,
+    "aircraft_cache_completeness_entries": 4096,
+    "aircraft_metadata_entries": 4096,
+    "aircraft_subject_bytes": 250,
     "capabilities": "none",
     "capacity_error": "state_capacity_exceeded",
     "catalog_entries": 10684,
-    "cgroup_current_kib": 60108,
+    "cgroup_current_kib": 71728,
     "channels": [
       "email",
       "pushover"
@@ -177,15 +182,21 @@
     "maintenance_pending": 1000,
     "max_encounters": 10000,
     "memory_limit_bytes": 100663296,
+    "model_cache_entries": 4096,
+    "model_cache_pages": 32,
+    "model_override_count": 1000,
     "network": "none",
     "normalized_source_rows": 20000,
-    "peak_rss_kib": 74876,
+    "operator_entries": 7000,
+    "override_count": 2000,
+    "peak_rss_kib": 93932,
     "pending_event_cap": 1000,
     "pending_events": 1000,
     "pending_jobs": 2000,
     "per_band_source_rows": 10000,
     "provider_dispatches": 0,
     "readonly_root": true,
-    "rss_kib": 57692
+    "rss_kib": 69592,
+    "type_name_entries": 4000
   }
 }

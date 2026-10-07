@@ -1,0 +1,333 @@
+--- a/src/adapters/adsb.mjs
++++ b/src/adapters/adsb.mjs
+@@ -19,6 +19,8 @@
+ const IMAGE_NAMES = Object.freeze(['ultrafeeder', 'piaware', 'airspy', 'dump978', 'proxy', 'cloudflared'])
+ const ALERT_CATEGORIES = Object.freeze(['military', 'medical', 'news'])
+ const ICAO = /^[0-9A-F]{6}$/
++const AIRCRAFT_MODEL = /^[A-Z0-9]{2,4}$/
++const ALERT_CHANNELS = Object.freeze(['pushover', 'email'])
+ const HOSTNAME = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/
+ const APPLICATION_ROOT = 'opt/adsb/current'
+ const APPLICATION_REQUIRED = Object.freeze([
+@@ -124,6 +126,19 @@
+   [`${APPLICATION_ROOT}/deploy/backup/backup-proof.sh`, { mode: 0o755, maximumBytes: 1024 * 1024 }]
+ ]))
+ 
++const UPDATE_APPLICATION_FILES = Object.freeze(new Map([
++  ...['update_admin.py', 'update_evidence.py', 'update_worker.py'].map((name) => [`${APPLICATION_ROOT}/adsb_admin/${name}`, { mode: 0o644, maximumBytes: 1024 * 1024 }]),
++  ...['adsb-updater.service', 'adsb-updater.path', 'adsb-activation-recovery.service'].map((name) => [`${APPLICATION_ROOT}/deploy/${name}`, { mode: 0o644, maximumBytes: 64 * 1024 }]),
++  [`${APPLICATION_ROOT}/deploy/alerts/prove-sources.py`, { mode: 0o644, maximumBytes: 1024 * 1024 }]
++]))
++const DOCKER_RECOVERY_TEMPLATE = `${APPLICATION_ROOT}/deploy/docker-recovery.conf`
++const UPDATE_HOST_FILES = Object.freeze(new Map([
++  ['etc/systemd/system/adsb-updater.service', 'deploy/adsb-updater.service'],
++  ['etc/systemd/system/adsb-updater.path', 'deploy/adsb-updater.path'],
++  ['etc/systemd/system/adsb-activation-recovery.service', 'deploy/adsb-activation-recovery.service'],
++  ['etc/systemd/system/docker.service.d/20-adsb-recovery.conf', 'deploy/docker-recovery.conf']
++]))
++
+ // parse one required JSON document
+ async function readJson(path) {
+   let value
+@@ -151,8 +166,8 @@
+ }
+ 
+ // validate one supported nonempty category subset
+-function validAlertCategories(value) {
+-  return Array.isArray(value) && value.length > 0 && value.length <= ALERT_CATEGORIES.length &&
++function validAlertCategories(value, allowEmpty = false) {
++  return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= ALERT_CATEGORIES.length &&
+     value.every((category) => ALERT_CATEGORIES.includes(category)) && new Set(value).size === value.length
+ }
+ 
+@@ -188,11 +203,22 @@
+ 
+ // validate the complete private alert settings document
+ function validateAlertSettings(settings) {
+-  invariant(hasExactKeys(settings, ['schema_version', 'revision', 'enabled', 'categories', 'pushover', 'smtp', 'overrides']), 'CONTENT_INVALID', 'ADS-B alert settings schema differs')
++  const legacyKeys = ['schema_version', 'revision', 'enabled', 'categories', 'pushover', 'smtp', 'overrides']
++  const currentShape = hasExactKeys(settings, [...legacyKeys, 'category_channels'])
++  invariant(currentShape || hasExactKeys(settings, legacyKeys), 'CONTENT_INVALID', 'ADS-B alert settings schema differs')
+   invariant(settings.schema_version === 1, 'CONTENT_INVALID', 'ADS-B alert settings version differs')
+   invariant(Number.isInteger(settings.revision) && settings.revision >= 0, 'CONTENT_INVALID', 'ADS-B alert settings revision is invalid')
+   invariant(typeof settings.enabled === 'boolean', 'CONTENT_INVALID', 'ADS-B alert enabled state is invalid')
+-  invariant(validAlertCategories(settings.categories), 'CONTENT_INVALID', 'ADS-B alert categories are invalid')
++  invariant(validAlertCategories(settings.categories, true), 'CONTENT_INVALID', 'ADS-B alert categories are invalid')
++  const routes = currentShape ? settings.category_channels : Object.fromEntries(ALERT_CATEGORIES.map((category) => [category, settings.categories.includes(category) ? [...ALERT_CHANNELS] : []]))
++  invariant(hasExactKeys(routes, ALERT_CATEGORIES), 'CONTENT_INVALID', 'ADS-B alert routing schema differs')
++  // bind every nonempty category to a unique supported channel subset
++  for (const category of ALERT_CATEGORIES) {
++    const channels = routes[category]
++    invariant(Array.isArray(channels) && channels.length <= ALERT_CHANNELS.length && channels.every((channel) => ALERT_CHANNELS.includes(channel)) && new Set(channels).size === channels.length, 'CONTENT_INVALID', 'ADS-B alert routes are invalid')
++    invariant(settings.categories.includes(category) === (channels.length > 0), 'CONTENT_INVALID', 'ADS-B alert routes and categories differ')
++  }
++  const selectedChannels = new Set(Object.values(routes).flat())
+   invariant(hasExactKeys(settings.pushover, ['app_token', 'user_key']), 'CONTENT_INVALID', 'ADS-B Pushover settings schema differs')
+   invariant(validAlertSecret(settings.pushover.app_token) && validAlertSecret(settings.pushover.user_key), 'CONTENT_INVALID', 'ADS-B Pushover settings are invalid')
+   invariant(hasExactKeys(settings.smtp, ['host', 'port', 'username', 'password', 'from_address', 'to_address']), 'CONTENT_INVALID', 'ADS-B SMTP settings schema differs')
+@@ -208,27 +234,32 @@
+   invariant(Array.isArray(settings.overrides) && settings.overrides.length <= 2_000, 'CONTENT_INVALID', 'ADS-B alert overrides are invalid')
+   const identities = new Set()
+ 
+-  // validate every exact-identity override once
++  // validate each exact-aircraft or model selector once
+   for (const override of settings.overrides) {
+-    invariant(hasExactKeys(override, ['hex', 'mode', 'categories', 'label']), 'CONTENT_INVALID', 'ADS-B alert override schema differs')
+-    invariant(typeof override.hex === 'string' && ICAO.test(override.hex.toUpperCase()), 'CONTENT_INVALID', 'ADS-B alert override identity is invalid')
++    const hexSelector = hasExactKeys(override, ['hex', 'mode', 'categories', 'label'])
++    invariant(hexSelector || hasExactKeys(override, ['model', 'mode', 'categories', 'label']), 'CONTENT_INVALID', 'ADS-B alert override schema differs')
++    const selector = hexSelector ? 'hex' : 'model'
++    const pattern = hexSelector ? ICAO : AIRCRAFT_MODEL
++    invariant(typeof override[selector] === 'string' && pattern.test(override[selector].toUpperCase()), 'CONTENT_INVALID', 'ADS-B alert override identity is invalid')
+     invariant(override.mode === 'include' || override.mode === 'exclude', 'CONTENT_INVALID', 'ADS-B alert override mode is invalid')
+     invariant(validAlertCategories(override.categories), 'CONTENT_INVALID', 'ADS-B alert override categories are invalid')
+     invariant(typeof override.label === 'string' && textLength(override.label) <= 100 && ![...override.label].some((character) => character.codePointAt(0) < 32), 'CONTENT_INVALID', 'ADS-B alert override label is invalid')
+-    const identity = override.hex.toUpperCase()
++    const identity = `${selector}:${override[selector].toUpperCase()}`
+     invariant(!identities.has(identity), 'CONTENT_INVALID', 'ADS-B alert override identity is duplicated')
+     identities.add(identity)
+   }
+ 
+-  // require both complete channels before activation
++  // require credentials only for selected destinations before activation
+   if (settings.enabled) {
+-    invariant(
+-      settings.pushover.app_token !== '' && settings.pushover.user_key !== '' &&
+-        settings.smtp.host !== '' && settings.smtp.username !== '' && settings.smtp.password !== '' &&
+-        settings.smtp.from_address !== '' && settings.smtp.to_address !== '',
+-      'CONTENT_INVALID',
+-      'ADS-B enabled alert channels are incomplete'
+-    )
++    invariant(selectedChannels.size > 0, 'CONTENT_INVALID', 'ADS-B enabled alerts have no destination')
++    // push-only routes do not require SMTP credentials
++    if (selectedChannels.has('pushover')) {
++      invariant(settings.pushover.app_token !== '' && settings.pushover.user_key !== '', 'CONTENT_INVALID', 'ADS-B enabled push alerts are incomplete')
++    }
++    // email-only routes do not require Pushover credentials
++    if (selectedChannels.has('email')) {
++      invariant(settings.smtp.host !== '' && settings.smtp.username !== '' && settings.smtp.password !== '' && settings.smtp.from_address !== '' && settings.smtp.to_address !== '', 'CONTENT_INVALID', 'ADS-B enabled email alerts are incomplete')
++    }
+   }
+ }
+ 
+@@ -601,13 +632,13 @@
+   invariant(entry.uid === 0 && entry.gid === 0, 'CONTENT_INVALID', 'ADS-B root-owned file metadata differs')
+ }
+ 
+-// validate one bounded alert release file header
+-function validateAlertApplicationEntry(entry, expected) {
++// validate one bounded immutable release file header
++function validateReleaseFileEntry(entry, expected) {
+   invariant(
+     entry?.type === 'file' && entry.mode === expected.mode && entry.size > 0 &&
+       entry.size <= expected.maximumBytes && entry.uid === 0 && entry.gid === 0,
+     'CONTENT_INVALID',
+-    'ADS-B alert release file metadata differs'
++    'ADS-B selected release file metadata differs'
+   )
+ }
+ 
+@@ -642,10 +673,53 @@
+ 
+   // require every alert module and reviewed release artifact
+   for (const [path, expected] of ALERT_APPLICATION_FILES) {
+-    validateAlertApplicationEntry(byPath.get(path), expected)
++    validateReleaseFileEntry(byPath.get(path), expected)
+   }
+ 
+   return true
++}
++
++// preserve pre-update archives while requiring every member of detected update versions
++function validateUpdateBundleEntries(byPath) {
++  const applicationPresent = [...UPDATE_APPLICATION_FILES.keys()].some((path) => byPath.has(path))
++  const guarded = byPath.has(DOCKER_RECOVERY_TEMPLATE)
++  const hostPresent = [...UPDATE_HOST_FILES.keys()].filter((path) => byPath.has(path))
++  // a true legacy archive has no new update or guard artifacts
++  if (!applicationPresent && !guarded && hostPresent.length === 0) {
++    return
++  }
++  // any update marker requires the entire historical application closure
++  for (const [path, expected] of UPDATE_APPLICATION_FILES) {
++    validateReleaseFileEntry(byPath.get(path), expected)
++  }
++  invariant(guarded ? hostPresent.length === UPDATE_HOST_FILES.size : hostPresent.length === 0, 'CONTENT_INVALID', 'ADS-B update host guard bundle is incomplete')
++  // historical updater archives predate the Docker recovery guard
++  if (!guarded) {
++    return
++  }
++  validateReleaseFileEntry(byPath.get(DOCKER_RECOVERY_TEMPLATE), { mode: 0o644, maximumBytes: 64 * 1024 })
++  // validate exact root metadata before admitting host files to the allowlist
++  for (const path of UPDATE_HOST_FILES.keys()) {
++    const entry = byPath.get(path)
++    validateFixedEntry(entry, 0o644)
++    invariant(entry.size > 0 && entry.size <= 64 * 1024, 'CONTENT_INVALID', 'ADS-B update host unit is unbounded')
++  }
++}
++
++// bind every guarded host artifact to the selected immutable release without execution
++async function validateUpdateHostBundle(root, manifest) {
++  // compare fixed host bytes to reviewed release templates
++  for (const [hostPath, templatePath] of UPDATE_HOST_FILES) {
++    let template = await readFile(join(root, APPLICATION_ROOT, templatePath))
++    // recovery is the only template with an installer-specific immutable binding
++    if (templatePath === 'deploy/adsb-activation-recovery.service') {
++      const text = template.toString('utf8')
++      invariant(text.split('@ADSB_RECOVERY_INSTALLER@').length === 2, 'CONTENT_INVALID', 'ADS-B recovery template binding differs')
++      template = Buffer.from(text.replace('@ADSB_RECOVERY_INSTALLER@', `/opt/adsb/releases/${manifest.applicationRelease}/deploy/install.sh`))
++    }
++    const host = await readFile(join(root, hostPath))
++    invariant(host.equals(template), 'CONTENT_INVALID', 'ADS-B update host integration differs from its release')
++  }
+ }
+ 
+ // validate the closed archive member set
+@@ -665,6 +739,7 @@
+   }
+ 
+   const alertBundle = validateAlertBundleEntries(byPath)
++  validateUpdateBundleEntries(byPath)
+ 
+   // reject content outside the restore allowlist
+   for (const entry of entries) {
+@@ -679,6 +754,11 @@
+     // accept only already-validated optional alert host files
+     if (ALERT_HOST_FILES.has(entry.path)) {
+       invariant(alertBundle, 'CONTENT_INVALID', 'ADS-B archive contains a partial alert host bundle')
++      continue
++    }
++
++    // accept only the complete prevalidated guarded update host bundle
++    if (UPDATE_HOST_FILES.has(entry.path)) {
+       continue
+     }
+ 
+@@ -777,6 +857,11 @@
+   // validate optional alerts only through inert data readers
+   if (alertBundle) {
+     await validateAlertBundle(root, images)
++  }
++
++  // newer releases bind every root guard to their selected immutable application
++  if (entries.some((entry) => entry.path === DOCKER_RECOVERY_TEMPLATE)) {
++    await validateUpdateHostBundle(root, manifest)
+   }
+ 
+   await readJson(join(root, `${APPLICATION_ROOT}/deploy/update-channels.json`))
+--- a/test/unit/adapters.test.mjs
++++ b/test/unit/adapters.test.mjs
+@@ -62,6 +62,114 @@
+     ...snapshot
+   }
+ }
++
++// build current private routing without contacting notification providers
++function routedAlertSettings(overrides = {}) {
++  return {
++    schema_version: 1,
++    revision: 2,
++    enabled: false,
++    categories: ['military', 'medical', 'news'],
++    category_channels: { military: ['pushover'], medical: ['email'], news: ['pushover', 'email'] },
++    pushover: { app_token: '', user_key: '' },
++    smtp: { host: '', port: 465, username: '', password: '', from_address: '', to_address: '' },
++    overrides: [{ model: 'H60', mode: 'include', categories: ['medical'], label: 'Rescue type' }, { hex: 'A2CCA7', mode: 'include', categories: ['news'], label: 'Exact aircraft' }],
++    ...overrides
++  }
++}
++
++// reconstruct versioned update files and optionally their exact guarded host integration
++function updateFixtureFiles(guarded = false) {
++  const recovery = '[Service]\nExecStart=/usr/bin/bash @ADSB_RECOVERY_INSTALLER@ --recover-only\n'
++  const files = [
++    ['opt/adsb/current/adsb_admin/update_admin.py', 'pass\n', 0o644],
++    ['opt/adsb/current/adsb_admin/update_evidence.py', 'pass\n', 0o644],
++    ['opt/adsb/current/adsb_admin/update_worker.py', 'pass\n', 0o644],
++    ['opt/adsb/current/deploy/adsb-updater.service', '[Service]\n', 0o644],
++    ['opt/adsb/current/deploy/adsb-updater.path', '[Path]\n', 0o644],
++    ['opt/adsb/current/deploy/adsb-activation-recovery.service', recovery, 0o644],
++    ['opt/adsb/current/deploy/alerts/prove-sources.py', 'pass\n', 0o644]
++  ]
++  // newer guards must accompany a complete root host bundle
++  if (guarded) {
++    files.push(
++      ['opt/adsb/current/deploy/docker-recovery.conf', '[Unit]\nRequires=adsb-activation-recovery.service\n', 0o644],
++      ['etc/systemd/system/adsb-updater.service', '[Service]\n', 0o644],
++      ['etc/systemd/system/adsb-updater.path', '[Path]\n', 0o644],
++      ['etc/systemd/system/adsb-activation-recovery.service', recovery.replace('@ADSB_RECOVERY_INSTALLER@', '/opt/adsb/releases/20260908T180000Z-fixture/deploy/install.sh'), 0o644],
++      ['etc/systemd/system/docker.service.d/20-adsb-recovery.conf', '[Unit]\nRequires=adsb-activation-recovery.service\n', 0o644]
++    )
++  }
++  return files
++}
++
++test('U-ARC-ADSB-15 current routes model rules and single-provider activation remain restorable', async () => {
++  const root = await createTestRoot()
++  // clean only this isolated archive and age identity
++  try {
++    const fixture = await createAdsbFixtureConfig(root)
++    const variants = [
++      routedAlertSettings(),
++      routedAlertSettings({ categories: [], category_channels: { military: [], medical: [], news: [] } }),
++      routedAlertSettings({ enabled: true, categories: ['military'], category_channels: { military: ['pushover'], medical: [], news: [] }, pushover: { app_token: 'fixture-app', user_key: 'fixture-user' } }),
++      routedAlertSettings({ enabled: true, categories: ['medical'], category_channels: { military: [], medical: ['email'], news: [] }, smtp: { host: 'mail.example', port: 465, username: 'fixture-user', password: 'fixture-password', from_address: 'receiver@example.com', to_address: 'operator@example.com' } })
++    ]
++    // prove real encrypted generations rather than a private validator call
++    for (const [index, alertSettings] of variants.entries()) {
++      const result = await verifyAdsbVariant(root, fixture, `current-alert-${index}`, { alertBundle: true, alertSettings })
++      assert.equal(result.archiveVerified, true)
++      assert.equal(result.healthEligible, true)
++    }
++  } finally {
++    await removeTestRoot(root)
++  }
++})
++
++test('U-ARC-ADSB-16 current route and selector corruption remains fail closed', async () => {
++  const root = await createTestRoot()
++  // clean only this isolated archive and age identity
++  try {
++    const fixture = await createAdsbFixtureConfig(root)
++    const variants = [
++      { category_channels: { military: ['email'], medical: [], news: [] } },
++      { category_channels: { military: ['email', 'email'], medical: ['email'], news: ['email'] } },
++      { category_channels: { military: ['sms'], medical: ['email'], news: ['email'] } },
++      { category_channels: { military: ['email'], medical: ['email'] } },
++      { enabled: true, categories: [], category_channels: { military: [], medical: [], news: [] } },
++      { enabled: true },
++      { overrides: [{ hex: 'A2CCA7', model: 'H60', mode: 'include', categories: ['medical'], label: '' }] },
++      { overrides: [{ model: 'H', mode: 'include', categories: ['medical'], label: '' }] },
++      { overrides: [{ model: 'H60', mode: 'include', categories: ['medical'], label: '' }, { model: 'h60', mode: 'exclude', categories: ['news'], label: '' }] }
++    ]
++    // reject the entire encrypted snapshot for every invalid private schema
++    for (const [index, change] of variants.entries()) {
++      await assert.rejects(verifyAdsbVariant(root, fixture, `bad-current-alert-${index}`, { alertBundle: true, alertSettings: routedAlertSettings(change) }), { code: 'CONTENT_INVALID' })
++    }
++  } finally {
++    await removeTestRoot(root)
++  }
++})
++
++test('U-ARC-ADSB-17 update control plane closure preserves historical versions and rejects partial guards', async () => {
++  const root = await createTestRoot()
++  // clean only this isolated archive and age identity
++  try {
++    const fixture = await createAdsbFixtureConfig(root)
++    // accept both the historical updater and the newly guarded release
++    for (const guarded of [false, true]) {
++      const result = await verifyAdsbVariant(root, fixture, `complete-updater-${guarded}`, { alertBundle: true, extraFiles: updateFixtureFiles(guarded) })
++      assert.equal(result.archiveVerified, true)
++    }
++    // one missing module or host guard invalidates the whole recovery closure
++    for (const missing of ['opt/adsb/current/adsb_admin/update_worker.py', 'etc/systemd/system/adsb-updater.path', 'etc/systemd/system/docker.service.d/20-adsb-recovery.conf']) {
++      await assert.rejects(verifyAdsbVariant(root, fixture, `partial-update-${missing.replaceAll('/', '-')}`, { alertBundle: true, extraFiles: updateFixtureFiles(true).filter(([path]) => path !== missing) }), { code: 'CONTENT_INVALID' })
++    }
++    const changed = updateFixtureFiles(true).map(([path, content, mode]) => [path, path === 'etc/systemd/system/adsb-activation-recovery.service' ? content.replace('20260908T180000Z-fixture', 'wrong-release') : content, mode])
++    await assert.rejects(verifyAdsbVariant(root, fixture, 'wrong-recovery-binding', { alertBundle: true, extraFiles: changed }), { code: 'CONTENT_INVALID' })
++  } finally {
++    await removeTestRoot(root)
++  }
++})
+ 
+ test('U-ARC-01 real age decrypt and pg_restore list validate Weather fixture', async () => {
+   const root = await createTestRoot()

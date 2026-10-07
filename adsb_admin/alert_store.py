@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import tempfile
@@ -25,6 +26,33 @@ MAX_DB_BYTES = 256 * 1024 * 1024
 MAX_PENDING_EVENTS = 1_000
 MAX_ENCOUNTERS = 10_000
 MAX_MAINTENANCE_NOTIFICATIONS = 1_000
+
+
+# resolve one event's immutable union of selected delivery channels
+def _delivery_channels_for_categories(
+    categories: tuple[str, ...],
+    category_channels: dict[str, list[str]] | None,
+) -> tuple[str, ...]:
+    # preserve dual-channel behavior for legacy direct callers
+    if category_channels is None:
+        return DELIVERY_CHANNELS
+    # reject malformed internal routing snapshots before durable mutation
+    if not isinstance(category_channels, dict):
+        raise ValueError("invalid category channel routes")
+    selected: set[str] = set()
+    # union every matching role without duplicating provider jobs
+    for category in categories:
+        channels = category_channels.get(category, [])
+        # reject malformed routes before unioning them
+        if (
+            not isinstance(channels, list)
+            or any(not isinstance(channel, str) or channel not in DELIVERY_CHANNELS for channel in channels)
+            or len(channels) != len(set(channels))
+        ):
+            raise ValueError("invalid category channel routes")
+        selected.update(channels)
+    # preserve fixed channel ordering in the immutable job set
+    return tuple(channel for channel in DELIVERY_CHANNELS if channel in selected)
 
 
 # share bounded retry and ambiguous-send outcomes across notification types
@@ -200,6 +228,8 @@ class AlertStore:
                     categories_json TEXT NOT NULL,
                     bands_json TEXT NOT NULL,
                     receptions_json TEXT NOT NULL DEFAULT '{}',
+                    subject TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL DEFAULT '',
                     observed_at REAL NOT NULL,
                     created_at REAL NOT NULL,
                     config_revision INTEGER NOT NULL,
@@ -265,6 +295,17 @@ class AlertStore:
             # add the first-version reception qualifier to pre-release databases
             if "receptions_json" not in columns:
                 self._connection.execute("ALTER TABLE events ADD COLUMN receptions_json TEXT NOT NULL DEFAULT '{}'")
+            # add immutable flight text and retire detection-only delivery backlog
+            if "subject" not in columns or "body" not in columns:
+                # add only missing snapshot columns to existing private databases
+                for column in ("subject", "body"):
+                    # preserve existing snapshot columns
+                    if column not in columns:
+                        self._connection.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                self._connection.execute(
+                    "UPDATE outbox SET state='suppressed', error_code='alert_policy_changed', leased_at=NULL "
+                    "WHERE state IN ('pending','retry') AND event_id IN (SELECT id FROM events WHERE kind='aircraft')"
+                )
             encounter_columns = {
                 column["name"] for column in self._connection.execute("PRAGMA table_info(encounters)").fetchall()
             }
@@ -438,15 +479,26 @@ class AlertStore:
         observed_at: float,
         config_revision: int,
         enabled: bool,
+        category_channels: dict[str, list[str]] | None = None,
         required_bands: set[str] | None = None,
         receptions: dict[str, str] | None = None,
+        eligible: bool = True,
+        subject: str = "",
+        body: str = "",
     ) -> str | None:
         normalized = normalize_icao(hex_id)
+        delivery_channels = _delivery_channels_for_categories(categories, category_channels)
         # reject non-catalog identities and unbounded input
         actual_required_bands = set(required_bands or bands)
         actual_receptions = receptions or {band: "direct" for band in bands}
         if (
             normalized is None
+            or not isinstance(eligible, bool)
+            or not isinstance(subject, str)
+            or len(subject) > 250
+            or not isinstance(body, str)
+            or len(body) > 1024
+            or any(ord(character) < 32 for character in subject + body)
             or not bands
             or not bands.issubset({"1090", "978"})
             or not actual_required_bands
@@ -504,8 +556,8 @@ class AlertStore:
                         categories_json,
                     ),
                 )
-            # keep disabled, unknown, and already-notified encounters silent
-            if not enabled or not categories or notified:
+            # keep outside-radius, disabled, unrouted and already-notified encounters silent
+            if not eligible or not enabled or not categories or not delivery_channels or notified:
                 return current_event_id
             pending_events = self._connection.execute(
                 """
@@ -528,8 +580,8 @@ class AlertStore:
                 """
                 INSERT INTO events(
                     id, kind, hex, label, categories_json, bands_json, receptions_json,
-                    observed_at, created_at, config_revision, deadline_at
-                ) VALUES(?, 'aircraft', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observed_at, created_at, config_revision, deadline_at, subject, body
+                ) VALUES(?, 'aircraft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -542,10 +594,12 @@ class AlertStore:
                     observed_at,
                     config_revision,
                     deadline_at,
+                    subject,
+                    body,
                 ),
             )
-            # schedule both channels exactly once
-            for channel in DELIVERY_CHANNELS:
+            # schedule each selected channel exactly once
+            for channel in delivery_channels:
                 self._connection.execute(
                     """
                     INSERT INTO outbox(
@@ -680,7 +734,7 @@ class AlertStore:
                 SELECT
                     o.event_id, o.channel, o.attempts, o.deadline_at, o.config_revision, o.message_id,
                     e.kind, e.hex, e.label, e.categories_json, e.bands_json, e.receptions_json,
-                    e.observed_at, e.created_at
+                    e.observed_at, e.created_at, e.subject, e.body
                 FROM outbox o
                 JOIN events e ON e.id=o.event_id
                 WHERE o.state IN ('pending','retry') AND o.next_attempt_at <= ? AND o.config_revision=?
@@ -718,6 +772,8 @@ class AlertStore:
                             "receptions": json.loads(row["receptions_json"]),
                             "observed_at": row["observed_at"],
                             "created_at": row["created_at"],
+                            "subject": row["subject"],
+                            "body": row["body"],
                         }
                     )
             return claimed
@@ -755,7 +811,7 @@ class AlertStore:
             )
             return True
 
-    # baseline old reports and enqueue each new maintenance result once
+    # baseline old reports and deduplicate new stable update notices
     def observe_maintenance(
         self,
         *,
@@ -765,6 +821,9 @@ class AlertStore:
         smtp_configured: bool,
         subject: str,
         body: str,
+        notice_id: str | None = None,
+        notice_ids: list[str] | None = None,
+        notify: bool = True,
     ) -> str | None:
         # reject malformed clocks and oversized frozen messages
         if (
@@ -776,29 +835,74 @@ class AlertStore:
             or any(character in subject for character in "\r\n")
             or not isinstance(body, str)
             or len(body) > 8_192
+            or (
+                notice_id is not None
+                and (not isinstance(notice_id, str) or not re.fullmatch(r"[a-f0-9]{64}", notice_id))
+            )
+            or type(notify) is not bool
+            or (
+                notice_ids is not None
+                and (
+                    notice_id is None
+                    or not isinstance(notice_ids, list)
+                    or len(notice_ids) > 7
+                    or any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{64}", item) for item in notice_ids)
+                )
+            )
         ):
             raise ValueError("invalid maintenance notification")
         with self._lock, self._connection:
             cursor = self._connection.execute("SELECT value FROM meta WHERE key='maintenance_report_seen'").fetchone()
-            # first activation and restore never replay an existing review
-            if cursor is None:
+            initial_report = cursor is None
+            # initialize even an empty successful check before dedupe can return
+            if initial_report:
                 self._connection.execute(
                     "INSERT INTO meta(key, value) VALUES('maintenance_report_seen', ?)",
                     (str(0 if reported_at is None else reported_at),),
                 )
+            seen = []
+            # persist stable identities independently of weekly report timestamps
+            if notice_id is not None:
+                notice_cursor = self._connection.execute(
+                    "SELECT value FROM meta WHERE key='maintenance_notice_seen'"
+                ).fetchone()
+                seen = json.loads(notice_cursor["value"]) if notice_cursor is not None else []
+                # fail closed rather than replaying a corrupted identity ledger
+                if (
+                    not isinstance(seen, list)
+                    or len(seen) > MAX_MAINTENANCE_NOTIFICATIONS
+                    or any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{64}", item) for item in seen)
+                ):
+                    raise ValueError("invalid maintenance notice ledger")
+                identities = notice_ids if notice_ids is not None else [notice_id]
+                unseen = [identity for identity in identities if identity not in seen]
+                # consume new holds without resending unchanged peers after removal
+                if unseen:
+                    seen.extend(unseen)
+                    self._connection.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES('maintenance_notice_seen', ?)",
+                        (json.dumps(seen[-MAX_MAINTENANCE_NOTIFICATIONS:], separators=(",", ":")),),
+                    )
+                else:
+                    return None
+            # first activation and restore never replay an existing review
+            if initial_report:
                 return None
             # ignore missing, duplicate and older report generations
-            if reported_at is None or reported_at <= float(cursor["value"]):
+            if reported_at is None or (notice_id is None and reported_at <= float(cursor["value"])):
                 return None
-            self._connection.execute("UPDATE meta SET value=? WHERE key='maintenance_report_seen'", (str(reported_at),))
+            self._connection.execute(
+                "UPDATE meta SET value=? WHERE key='maintenance_report_seen'",
+                (str(max(reported_at, float(cursor["value"]))),),
+            )
             # remember unconfigured runs without creating a later backlog
-            if not smtp_configured:
+            if not smtp_configured or not notify:
                 return None
             count = self._connection.execute("SELECT COUNT(*) FROM maintenance_notifications").fetchone()[0]
             # keep the additive queue bounded without changing aircraft state
             if count >= MAX_MAINTENANCE_NOTIFICATIONS or not self._has_capacity():
                 raise RuntimeError("maintenance notification capacity exceeded")
-            event_id = "maintenance-" + hashlib.sha256(str(reported_at).encode("ascii")).hexdigest()[:32]
+            event_id = "maintenance-" + hashlib.sha256((notice_id or str(reported_at)).encode("ascii")).hexdigest()[:32]
             self._connection.execute(
                 """
                 INSERT INTO maintenance_notifications(
@@ -922,6 +1026,7 @@ class AlertStore:
         current_revision: int,
         enabled: bool,
         now: float,
+        channels: tuple[str, ...] = DELIVERY_CHANNELS,
     ) -> dict[str, Any]:
         # accept only canonical bounded request identifiers
         try:
@@ -955,6 +1060,16 @@ class AlertStore:
                     (normalized_request_id, config_revision, created_at, error_code),
                 )
                 return self.test_ack(normalized_request_id) or {}
+            # require at least one unique configured provider only for accepted requests
+            if (
+                not isinstance(channels, tuple)
+                or not channels
+                or any(channel not in DELIVERY_CHANNELS for channel in channels)
+                or len(channels) != len(set(channels))
+            ):
+                raise ValueError("invalid test notification channels")
+            # preserve fixed provider order in the requested test jobs
+            ordered_channels = tuple(channel for channel in DELIVERY_CHANNELS if channel in channels)
             event_id = f"test-{normalized_request_id}"
             deadline_at = created_at + 300.0
             self._connection.execute(
@@ -966,8 +1081,8 @@ class AlertStore:
                 """,
                 (event_id, created_at, created_at, config_revision, deadline_at),
             )
-            # queue one fixed test per channel
-            for channel in DELIVERY_CHANNELS:
+            # queue one fixed test per configured channel
+            for channel in ordered_channels:
                 self._connection.execute(
                     """
                     INSERT INTO outbox(

@@ -29,19 +29,94 @@ class AlertStoreTest(unittest.TestCase):
         self.temporary.cleanup()
 
     # create one qualifying observation
-    def observe(self, *, observed_at: float = 100.0, revision: int = 1) -> str:
+    def observe(
+        self,
+        *,
+        observed_at: float = 100.0,
+        revision: int = 1,
+        hex_id: str = "A2CCA7",
+        categories: tuple[str, ...] = ("news",),
+        category_channels: dict[str, list[str]] | None = None,
+    ) -> str:
         event_id = self.store.observe_aircraft(
-            hex_id="A2CCA7",
+            hex_id=hex_id,
             label="News Helicopter",
-            categories=("news",),
+            categories=categories,
             bands={"1090"},
             required_bands={"1090", "978"},
             observed_at=observed_at,
             config_revision=revision,
             enabled=True,
+            category_channels=category_channels,
         )
         self.assertIsNotNone(event_id)
         return event_id or ""
+
+    # preserve presence without consuming a notification outside the radius
+    def test_ineligible_observation_can_notify_on_later_entry(self) -> None:
+        arguments = {
+            "hex_id": "A2CCA7",
+            "label": "News Helicopter",
+            "categories": ("news",),
+            "bands": {"1090"},
+            "observed_at": 100,
+            "config_revision": 1,
+            "enabled": True,
+        }
+        self.assertIsNone(self.store.observe_aircraft(**arguments, eligible=False))
+        self.assertFalse(self.store.active_encounters()[0]["notified"])
+        event = self.store.observe_aircraft(
+            **{**arguments, "observed_at": 101},
+            eligible=True,
+            subject="News aircraft above Whidbey",
+            body="A2CCA7 H60 flying 115 mph N at 1,000 feet",
+        )
+        self.assertIsNotNone(event)
+        self.assertTrue(self.store.active_encounters()[0]["notified"])
+
+    # carry the original notification text through retry and process restart
+    def test_flight_text_snapshot_survives_restart_and_retry(self) -> None:
+        subject = "News aircraft above Whidbey"
+        body = "Example Air Boeing 737-800 flying 1,151 mph NNW at 12,500 feet"
+        event = self.store.observe_aircraft(
+            hex_id="A2CCA7",
+            label="News",
+            categories=("news",),
+            bands={"1090"},
+            observed_at=100,
+            config_revision=1,
+            enabled=True,
+            subject=subject,
+            body=body,
+        )
+        job = self.store.claim_deliveries(now=101, config_revision=1, enabled=True, channel="email")[0]
+        self.store.complete_delivery(event, "email", DeliveryResult("retry", "smtp_unavailable", 5), now=101)
+        self.store.close()
+        self.store = AlertStore(self.path)
+        retried = self.store.claim_deliveries(now=106, config_revision=1, enabled=True, channel="email")[0]
+        self.assertEqual((subject, body), (retried["subject"], retried["body"]))
+        self.assertEqual(job["message_id"], retried["message_id"])
+
+    # suppress old detection-only jobs while preserving requested test delivery
+    def test_additive_flight_migration_suppresses_only_aircraft_backlog(self) -> None:
+        self.observe()
+        self.store.acknowledge_test(
+            "a" * 32, config_revision=1, current_revision=1, created_at=100, now=100, enabled=True
+        )
+        self.store._connection.execute("ALTER TABLE events DROP COLUMN subject")
+        self.store._connection.execute("ALTER TABLE events DROP COLUMN body")
+        self.store._connection.commit()
+        self.store.close()
+        self.store = AlertStore(self.path)
+        history = self.store.history()["events"]
+        aircraft = next(row for row in history if row["kind"] == "aircraft")
+        test = next(row for row in history if row["kind"] == "test")
+        self.assertEqual({"suppressed"}, {channel["state"] for channel in aircraft["channels"].values()})
+        self.assertEqual({"alert_policy_changed"}, {channel["error"] for channel in aircraft["channels"].values()})
+        self.assertEqual({"pending"}, {channel["state"] for channel in test["channels"].values()})
+        self.assertEqual(
+            {"test"}, {job["kind"] for job in self.store.claim_deliveries(now=101, config_revision=1, enabled=True)}
+        )
 
     # observe one fixed maintenance review without aircraft delivery work
     def maintenance(self, at: float | None, *, now: float, configured: bool = True, revision: int = 1):
@@ -90,6 +165,92 @@ class AlertStoreTest(unittest.TestCase):
         self.maintenance(120, now=121, revision=2)
         self.assertEqual([], self.store.claim_maintenance(now=122, config_revision=2, smtp_configured=False))
         self.assertEqual("smtp_not_configured", self.store.maintenance_status()["error"])
+
+    # unchanged held candidates do not send a new email on weekly rediscovery
+    def test_stable_update_notices_deduplicate_and_consume_unconfigured_holds(self):
+        self.maintenance(90, now=100)
+        arguments = {
+            "reported_at": 110,
+            "now": 111,
+            "config_revision": 1,
+            "smtp_configured": True,
+            "subject": "Updates held",
+            "body": "Fixed held update",
+            "notice_id": "a" * 64,
+        }
+        self.assertIsNotNone(self.store.observe_maintenance(**arguments))
+        self.assertIsNone(self.store.observe_maintenance(**{**arguments, "reported_at": 120, "now": 121}))
+        self.store.close()
+        self.store = AlertStore(self.path)
+        self.assertIsNone(self.store.observe_maintenance(**{**arguments, "reported_at": 130, "now": 131}))
+        unconfigured = {**arguments, "notice_id": "b" * 64, "smtp_configured": False}
+        self.assertIsNone(self.store.observe_maintenance(**unconfigured))
+        self.assertIsNone(self.store.observe_maintenance(**{**unconfigured, "smtp_configured": True}))
+        suppressed = {**arguments, "notice_id": "c" * 64, "notify": False}
+        self.assertIsNone(self.store.observe_maintenance(**suppressed))
+        self.assertIsNone(self.store.observe_maintenance(**{**suppressed, "notify": True}))
+        self.assertIsNotNone(self.store.observe_maintenance(**{**arguments, "notice_id": "d" * 64}))
+
+    # empty initial discovery must not suppress the first subsequently held update
+    def test_initial_current_report_does_not_hide_first_hold(self):
+        arguments = {
+            "reported_at": 90,
+            "now": 100,
+            "config_revision": 1,
+            "smtp_configured": True,
+            "subject": "Maintenance current",
+            "body": "No holds",
+            "notice_id": "a" * 64,
+            "notice_ids": [],
+            "notify": False,
+        }
+        self.assertIsNone(self.store.observe_maintenance(**arguments))
+        held = {
+            **arguments,
+            "reported_at": 110,
+            "now": 111,
+            "notice_id": "b" * 64,
+            "notice_ids": ["c" * 64],
+            "notify": True,
+        }
+        self.assertIsNotNone(self.store.observe_maintenance(**held))
+        self.assertIsNone(self.store.observe_maintenance(**held))
+
+    # removing held candidates must not create a new notice for unchanged peers
+    def test_removing_a_hold_does_not_email_unchanged_candidates(self):
+        self.maintenance(90, now=100)
+        arguments = {
+            "reported_at": 110,
+            "now": 111,
+            "config_revision": 1,
+            "smtp_configured": True,
+            "subject": "Updates held",
+            "body": "Fixed held update",
+            "notice_id": "a" * 64,
+            "notice_ids": ["b" * 64, "c" * 64],
+        }
+        self.assertIsNotNone(self.store.observe_maintenance(**arguments))
+        self.assertIsNone(
+            self.store.observe_maintenance(**{**arguments, "notice_id": "d" * 64, "notice_ids": ["c" * 64]})
+        )
+        self.assertIsNotNone(
+            self.store.observe_maintenance(**{**arguments, "notice_id": "e" * 64, "notice_ids": ["c" * 64, "f" * 64]})
+        )
+
+    # stable notice baselines preserve the existing no-replay initialization rule
+    def test_initial_stable_notice_is_baselined(self):
+        arguments = {
+            "reported_at": 90,
+            "now": 100,
+            "config_revision": 1,
+            "smtp_configured": True,
+            "subject": "Updates held",
+            "body": "Fixed held update",
+            "notice_id": "a" * 64,
+        }
+        self.assertIsNone(self.store.observe_maintenance(**arguments))
+        self.assertIsNone(self.store.observe_maintenance(**{**arguments, "reported_at": 110, "now": 111}))
+        self.assertIsNotNone(self.store.observe_maintenance(**{**arguments, "notice_id": "b" * 64}))
 
     # preserve retry windows and stable smtp identifiers without duplicate completion
     def test_maintenance_transport_retry_and_acceptance(self):
@@ -147,6 +308,46 @@ class AlertStoreTest(unittest.TestCase):
         second = self.observe(observed_at=731.0)
         self.assertNotEqual(first, second)
         self.assertEqual(2, len(self.store.history()["events"]))
+
+    # freeze push-only email-only both off and multi-role routing per encounter
+    def test_category_routes_create_only_the_union_of_selected_channel_jobs(self) -> None:
+        push = self.observe(
+            hex_id="A00001",
+            categories=("news",),
+            category_channels={"military": [], "medical": [], "news": ["pushover"]},
+        )
+        email = self.observe(
+            hex_id="A00002",
+            categories=("medical",),
+            category_channels={"military": [], "medical": ["email"], "news": []},
+        )
+        both = self.observe(
+            hex_id="A00003",
+            categories=("military",),
+            category_channels={"military": ["pushover", "email"], "medical": [], "news": []},
+        )
+        multi_role = self.observe(
+            hex_id="A00004",
+            categories=("medical", "news"),
+            category_channels={"military": [], "medical": ["email"], "news": ["pushover", "email"]},
+        )
+        off = self.store.observe_aircraft(
+            hex_id="A00005",
+            label="Silent fixture",
+            categories=("news",),
+            bands={"1090"},
+            observed_at=100.0,
+            config_revision=1,
+            enabled=True,
+            category_channels={"military": [], "medical": [], "news": []},
+        )
+        self.assertIsNone(off)
+        events = {event["id"]: event for event in self.store.history()["events"]}
+        self.assertEqual({"pushover"}, set(events[push]["channels"]))
+        self.assertEqual({"email"}, set(events[email]["channels"]))
+        self.assertEqual({"pushover", "email"}, set(events[both]["channels"]))
+        self.assertEqual({"pushover", "email"}, set(events[multi_role]["channels"]))
+        self.assertEqual(4, len(events))
 
     # enforce the identity cap without evicting existing dedupe or continuity
     def test_identity_capacity_refuses_new_rows_but_preserves_existing_updates(self) -> None:
@@ -277,6 +478,36 @@ class AlertStoreTest(unittest.TestCase):
         )
         self.assertEqual("refused", stale["state"])
         self.assertEqual("configuration_changed", stale["error"])
+
+    # queue requested tests only for configured providers when supplied
+    def test_test_request_uses_supplied_configured_channels(self) -> None:
+        request_id = str(uuid.uuid4())
+        acknowledged = self.store.acknowledge_test(
+            request_id,
+            config_revision=1,
+            created_at=100.0,
+            current_revision=1,
+            enabled=True,
+            now=101.0,
+            channels=("email",),
+        )
+        self.assertEqual({"email"}, set(acknowledged["channels"]))
+
+    # refuse inactive requests durably even after every provider is cleared
+    def test_disabled_test_request_with_no_configured_channels_is_acknowledged(self) -> None:
+        request_id = str(uuid.uuid4())
+        acknowledged = self.store.acknowledge_test(
+            request_id,
+            config_revision=1,
+            created_at=100.0,
+            current_revision=1,
+            enabled=False,
+            now=101.0,
+            channels=(),
+        )
+        self.assertEqual("refused", acknowledged["state"])
+        self.assertEqual("alerts_disabled", acknowledged["error"])
+        self.assertEqual({}, acknowledged["channels"])
 
     # publish bounded secret-free continuity for encrypted backup
     def test_continuity_snapshot_has_required_bands_without_outbox(self) -> None:

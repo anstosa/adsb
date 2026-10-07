@@ -1,4 +1,4 @@
-"""Release-owned exact-identity aircraft role catalog."""
+"""Release-owned aircraft role catalog and operator override matching."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ CATALOG_SCHEMA_VERSION = 1
 MAX_CATALOG_BYTES = 4 * 1024 * 1024
 MAX_CATALOG_ENTRIES = 50_000
 ICAO_PATTERN = re.compile(r"^[0-9A-F]{6}$")
+AIRCRAFT_MODEL_PATTERN = re.compile(r"^[A-Z0-9]{2,4}$")
 
 
 # represent unavailable or invalid release data
@@ -39,6 +40,18 @@ def normalize_icao(value: Any) -> str | None:
     normalized = value.upper()
     # accept exactly six hexadecimal characters
     if ICAO_PATTERN.fullmatch(normalized) is None:
+        return None
+    return normalized
+
+
+# normalize one exact icao type designator
+def normalize_aircraft_model(value: Any) -> str | None:
+    # reject absent and nontext model metadata
+    if not isinstance(value, str):
+        return None
+    normalized = value.upper()
+    # accept only bounded alphanumeric type codes
+    if AIRCRAFT_MODEL_PATTERN.fullmatch(normalized) is None:
         return None
     return normalized
 
@@ -148,6 +161,7 @@ class AlertCatalog:
         hex_id: Any,
         *,
         db_flags: Any = None,
+        model: Any = None,
         overrides: Iterable[dict[str, Any]] = (),
     ) -> Classification:
         normalized = normalize_icao(hex_id)
@@ -162,12 +176,22 @@ class AlertCatalog:
         if isinstance(db_flags, int) and not isinstance(db_flags, bool) and db_flags >= 0 and db_flags & 1:
             categories.add("military")
             sources.add("dbFlags")
+        normalized_model = normalize_aircraft_model(model)
         includes: set[str] = set()
         excludes: set[str] = set()
-        # apply every exact normalized override defensively
+        model_label = ""
+        exact_label = ""
+        # apply every matching normalized override defensively
         for override in overrides:
             # ignore malformed rows from non-config callers
-            if not isinstance(override, dict) or normalize_icao(override.get("hex")) != normalized:
+            if not isinstance(override, dict):
+                continue
+            exact_match = normalize_icao(override.get("hex")) == normalized
+            model_match = (
+                normalized_model is not None and normalize_aircraft_model(override.get("model")) == normalized_model
+            )
+            # ignore overrides for a different aircraft or model
+            if not exact_match and not model_match:
                 continue
             mode = override.get("mode")
             values = override.get("categories")
@@ -182,9 +206,18 @@ class AlertCatalog:
             elif mode == "include":
                 includes.update(valid_values)
                 override_label = override.get("label")
-                # use one bounded operator label when present
+                # retain model and exact labels separately for precedence
                 if isinstance(override_label, str) and override_label:
-                    label = override_label
+                    # prefer the narrower exact-aircraft label
+                    if exact_match:
+                        exact_label = override_label
+                    elif model_match:
+                        model_label = override_label
+        # prefer an exact-aircraft label over a broader model label
+        if exact_label:
+            label = exact_label
+        elif model_label:
+            label = model_label
         # record override provenance only when it changes membership
         if includes or excludes:
             sources.add("override")

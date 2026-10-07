@@ -40,6 +40,10 @@ fixed_paths=(
     etc/systemd/system/adsb-admin.service
     etc/systemd/system/adsb-controller.service
     etc/systemd/system/adsb-alerts.service
+    etc/systemd/system/adsb-updater.service
+    etc/systemd/system/adsb-updater.path
+    etc/systemd/system/adsb-activation-recovery.service
+    etc/systemd/system/docker.service.d/20-adsb-recovery.conf
     etc/systemd/system/adsb-maintenance.service
     etc/systemd/system/adsb-maintenance.timer
     etc/systemd/system/apt-daily.timer.d/adsb-weekly.conf

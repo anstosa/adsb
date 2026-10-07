@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from adsb_admin.alert_catalog import AlertCatalog, CatalogError, normalize_icao
+from adsb_admin.alert_catalog import AlertCatalog, CatalogError, normalize_aircraft_model, normalize_icao
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = PROJECT_ROOT / "deploy/alerts/catalog.json"
@@ -51,6 +51,27 @@ class AlertCatalogTest(unittest.TestCase):
         self.assertEqual(("medical",), result.categories)
         self.assertEqual("Local role", result.label)
         self.assertIn("override", result.sources)
+
+    # combine exact and model overrides with exclusion and label precedence
+    def test_model_override_matching_exclusion_and_exact_label_precedence(self) -> None:
+        overrides = [
+            {"model": "C17", "mode": "include", "categories": ["medical"], "label": "C-17 fleet"},
+            {"hex": "ABCDEF", "mode": "include", "categories": ["news"], "label": "Local aircraft"},
+            {"model": "C17", "mode": "exclude", "categories": ["news"], "label": ""},
+            {"hex": "ABCDEF", "mode": "exclude", "categories": ["medical"], "label": ""},
+        ]
+        result = self.catalog.classify("abcdef", model="c17", overrides=overrides)
+        self.assertEqual((), result.categories)
+        self.assertEqual("Local aircraft", result.label)
+        self.assertIn("override", result.sources)
+        self.assertEqual(("medical",), self.catalog.classify("123456", model="C17", overrides=overrides).categories)
+
+    # reject qualified and unbounded model metadata
+    def test_model_normalization_requires_an_exact_type_designator(self) -> None:
+        self.assertEqual("H60", normalize_aircraft_model("h60"))
+        self.assertIsNone(normalize_aircraft_model("C-17"))
+        self.assertIsNone(normalize_aircraft_model("ABCDE"))
+        self.assertEqual((), self.catalog.classify("ABCDEF", model="C-17", overrides=[]).categories)
 
     # fail closed when reviewed bytes no longer match the manifest
     def test_catalog_digest_tamper_is_unavailable(self) -> None:

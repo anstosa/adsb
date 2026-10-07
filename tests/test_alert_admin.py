@@ -159,6 +159,57 @@ class AlertAdminServerTest(unittest.TestCase):
         self.assertNotIn("private@example.org", json.dumps(result))
         self.assertFalse(result["email_notifications"]["state"] == "not_configured")
 
+    # require only the selected provider for aircraft readiness
+    def test_single_channel_configuration_and_status(self) -> None:
+        headers = self.headers()
+        # keep provider availability and routing independent
+        for revision, channel in enumerate(("pushover", "email")):
+            with self.subTest(channel=channel):
+                payload = self.payload(enabled=True, revision=revision)
+                payload["categories"] = ["military"]
+                payload["category_channels"] = {"military": [channel], "medical": [], "news": []}
+                # clear only the unused provider's credentials
+                if channel == "pushover":
+                    payload["smtp"] = {"clear_username": True, "clear_password": True}
+                else:
+                    payload["pushover"] = {"clear_app_token": True, "clear_user_key": True}
+                status, _, saved = self.json_request(
+                    "PUT", "/api/admin/alerts/config", payload=payload, headers=headers
+                )
+                self.assertEqual(200, status)
+                self.assertEqual(payload["category_channels"], saved["category_channels"])
+                result = self.json_request("GET", "/api/admin/alerts/status", headers=headers)[2]
+                self.assertEqual("ready", result["configuration_state"])
+                self.assertEqual("unknown", result["channels"][channel]["state"])
+                unused = "email" if channel == "pushover" else "pushover"
+                self.assertEqual("disabled", result["channels"][unused]["state"])
+                self.assertEqual(0, self.server.application.settings.get_public()["revision"])
+                self.status_path.parent.mkdir(parents=True, exist_ok=True)
+                self.status_path.write_text(
+                    json.dumps({"alerts": {"activation_id": "routing-test", "source_contract_digest": "routing-proof"}})
+                )
+                (self.root / "alerts/worker-status.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "activation_id": "routing-test",
+                            "source_contract_digest": "routing-proof",
+                            "sampled_at": 1000,
+                            "process_running": True,
+                            "bands": {
+                                "1090": {"state": "healthy", "last_message_at": 1000},
+                                "978": {"state": "healthy", "last_message_at": 1000},
+                            },
+                            "channels": {channel: {"state": "accepted"}, unused: {"state": "failed"}},
+                        }
+                    )
+                )
+                with patch("adsb_admin.alert_admin.time.time", return_value=1000.0):
+                    result = self.json_request("GET", "/api/admin/alerts/status", headers=headers)[2]
+                self.assertEqual("ready", result["overall_state"])
+                self.assertEqual("accepted", result["channels"][channel]["state"])
+                self.assertEqual("disabled", result["channels"][unused]["state"])
+
     # stale and legacy workers cannot claim maintenance email delivery
     def test_maintenance_email_requires_current_worker_contract(self) -> None:
         headers = self.headers()

@@ -562,7 +562,7 @@ def log_failure(operation, error):
 
 
 # validate mandatory exact-pin g0 evidence without executing fixture code
-def validate_source_proof(proof, images, health_bytes, catalog_entries):
+def validate_source_proof(proof, images, health_bytes, catalog_entries, *, require_model_override_capacity=True):
     # reject an incomplete gate with a bounded public diagnostic
     def require(condition):
         if not condition:
@@ -671,6 +671,20 @@ def validate_source_proof(proof, images, health_bytes, catalog_entries):
         "provider_dispatches": 0,
         "catalog_entries": catalog_entries,
     }
+    # require maximum watchlists, metadata caches and flight messages for changed worker code
+    if require_model_override_capacity:
+        expected.update(
+            override_count=2000,
+            model_override_count=1000,
+            model_cache_entries=4096,
+            model_cache_pages=32,
+            aircraft_metadata_entries=4096,
+            aircraft_cache_completeness_entries=4096,
+            type_name_entries=4000,
+            operator_entries=7000,
+            aircraft_subject_bytes=250,
+            aircraft_body_bytes=1024,
+        )
     # require complete continuity and the maximal enforced workload
     for key, count in expected.items():
         require(type(worker.get(key)) is int and worker[key] == count)

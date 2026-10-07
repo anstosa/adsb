@@ -320,6 +320,36 @@ class AdminServerTest(unittest.TestCase):
         self.assertEqual("review", payload["images"][0]["status"])
         self.assertNotIn(secret, json.dumps(payload))
 
+    # install writes reuse session origin and csrf protections
+    def test_install_endpoint_requires_origin_session_csrf_and_exact_payload(self) -> None:
+        payload = {"candidate_ids": ["a" * 64, "c" * 64], "generation": "b" * 64}
+        cookie, csrf = self.login()
+        # reject each missing part of the existing mutation boundary
+        for headers, expected in (
+            ({"Origin": TEST_ORIGIN}, 401),
+            ({"Cookie": cookie, "Origin": "https://untrusted.invalid", "X-CSRF-Token": csrf}, 403),
+            ({"Cookie": cookie, "Origin": TEST_ORIGIN}, 403),
+        ):
+            with self.subTest(headers=headers):
+                status, _, _ = self.json_request(
+                    "POST", "/api/admin/maintenance/install", payload=payload, headers=headers
+                )
+                self.assertEqual(expected, status)
+        headers = {"Cookie": cookie, "Origin": TEST_ORIGIN, "X-CSRF-Token": csrf}
+        status, _, _ = self.json_request(
+            "POST", "/api/admin/maintenance/install", payload={**payload, "command": "pull"}, headers=headers
+        )
+        self.assertEqual(422, status)
+        status, _, _ = self.json_request("POST", "/api/admin/maintenance/install", payload=payload, headers=headers)
+        self.assertEqual(409, status)
+        self.assertFalse(self.server.application.updates.request_path.exists())
+        with patch.object(self.server.application.updates, "request_install", return_value=(202, {"state": "queued"})):
+            status, response_headers, body = self.json_request(
+                "POST", "/api/admin/maintenance/install", payload=payload, headers=headers
+            )
+            self.assertEqual((202, {"state": "queued"}), (status, body))
+            self.assertIn("no-store", response_headers["cache-control"])
+
     # optional notifier state cannot hide a valid maintenance report
     def test_maintenance_report_survives_notification_projection_failure(self) -> None:
         cookie, _ = self.login()

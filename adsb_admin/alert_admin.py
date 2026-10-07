@@ -174,13 +174,15 @@ class AlertAdmin:
     def status(self, *, now: float | None = None) -> dict[str, Any]:
         current = time.time() if now is None else now
         config = self.settings().get_public()
-        complete = (
-            config["pushover"]["app_token_configured"]
-            and config["pushover"]["user_key_configured"]
-            and config["smtp"]["username_configured"]
+        configured = {
+            "pushover": config["pushover"]["app_token_configured"] and config["pushover"]["user_key_configured"],
+            "email": config["smtp"]["username_configured"]
             and config["smtp"]["password_configured"]
-            and bool(config["smtp"]["host"] and config["smtp"]["from_address"] and config["smtp"]["to_address"])
-        )
+            and bool(config["smtp"]["host"] and config["smtp"]["from_address"] and config["smtp"]["to_address"]),
+        }
+        # require only channels selected for enabled aircraft types
+        selected = {channel for category in config["categories"] for channel in config["category_channels"][category]}
+        complete = bool(selected) and all(configured[channel] for channel in selected)
         try:
             worker = read_json(self.state_dir / "worker-status.json", 64 * 1024)
             controller = read_json(self.controller_path, 256 * 1024)
@@ -221,8 +223,11 @@ class AlertAdmin:
             channels[channel] = _channel_projection(
                 raw_channels.get(channel) if isinstance(raw_channels, dict) else None
             )
-            # describe configuration before delivery availability
-            if not complete:
+            # keep unused providers from degrading selected delivery channels
+            if channel not in selected:
+                channels[channel]["state"] = "disabled"
+            # describe each provider's own configuration before availability
+            elif not configured[channel]:
                 channels[channel]["state"] = "not_configured"
             elif not config["enabled"]:
                 channels[channel]["state"] = "disabled"

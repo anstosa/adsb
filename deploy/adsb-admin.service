@@ -1,6 +1,7 @@
 [Unit]
 Description=ADS-B authenticated station administration
-After=network.target
+After=network.target adsb-activation-recovery.service
+Requires=adsb-activation-recovery.service
 
 [Service]
 Type=simple

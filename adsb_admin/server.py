@@ -26,7 +26,7 @@ from .auth import (
     verify_password,
 )
 from .config import RevisionConflict, SettingsStore, ValidationError, sanitized_status
-from .maintenance import public_report
+from .update_admin import UpdateAdmin
 
 MAX_BODY_BYTES = 32 * 1024
 SECURE_SESSION_COOKIE_NAME = "__Host-adsb_admin_session"
@@ -144,6 +144,7 @@ class AdminApplication:
         self.web_root = web_root.resolve()
         self.settings = SettingsStore(settings_path)
         self.alerts = AlertAdmin(settings_path, status_path)
+        self.updates = UpdateAdmin(settings_path, status_path)
         self.status_path = status_path
         self.password_hash = password_hash
         self.origin = normalized_origin
@@ -244,12 +245,12 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, sanitized_status(self.server.application.status_path), cache=False)
             return
-        # keep package review and maintenance observations behind admin authentication
+        # keep update candidates and maintenance observations behind authentication
         if path == "/api/admin/maintenance":
             # require the same session boundary as receiver telemetry
             if self._require_authentication() is None:
                 return
-            report = public_report(self.server.application.status_path.with_name("maintenance.json"))
+            report = self.server.application.updates.report()
             try:
                 report["email_notifications"] = self.server.application.alerts.maintenance_email_status()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, RecursionError):
@@ -373,6 +374,31 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 return
             except (OSError, RuntimeError, sqlite3.Error):
                 self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "alerts_unavailable")
+                return
+            self._send_json(status, result, cache=False)
+            return
+        # authorize one exact candidate without exposing privileged commands
+        if path == "/api/admin/maintenance/install":
+            auth = self._require_authentication()
+            # reuse the established authenticated csrf boundary
+            if auth is None or not self._require_csrf(auth):
+                return
+            payload = self._read_json()
+            # preserve the body parser's error response
+            if payload is None:
+                return
+            try:
+                status, result = self.server.application.updates.request_install(payload)
+            except RevisionConflict as exc:
+                self._send_json(HTTPStatus.CONFLICT, exc.current, cache=False)
+                return
+            except ValidationError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "invalid_request", "fields": exc.fields}, cache=False
+                )
+                return
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError, RecursionError):
+                self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, "updates_unavailable")
                 return
             self._send_json(status, result, cache=False)
             return

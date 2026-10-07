@@ -28,6 +28,8 @@ INDEX_DATABASE_SOURCE = 'let databaseFolder = "https://static.airplanes.live/db"
 INDEX_FAVICON_SOURCE = '<link rel="icon" type="image/png" href="images/tar1090-favicon.png">'
 INDEX_TITLE_SOURCE = "<title>tar1090</title>"
 BUNDLE_METADATA_FILES = frozenset({"version.json", "provenance.json"})
+TRUSTED_CACHEBUST_SCRIPT_SHA256 = "eea2c14191ec4a32dd4d3548148e7455de3ac55f2ab3018f416b884a62454f99"
+TRUSTED_CACHEBUST_LIST_SHA256 = "71a9714220b443457a1a0dacae12d5916adcc5e7ab9ad29f9b80d5a38931d9f0"
 
 
 # parse the stable command-line interface
@@ -222,11 +224,15 @@ def verify_source_assets(html: Path, assets: dict) -> None:
 def cachebust(source_root: Path, html: Path, expected: dict) -> None:
     script = source_root / "cachebust.sh"
     file_list = source_root / "cachebust.list"
-    # require the reviewed upstream algorithm
-    if file_hash(script) != expected["script_sha256"]:
+    # require both candidate evidence and source bytes to match the fixed reviewed algorithm
+    if expected.get("script_sha256") != TRUSTED_CACHEBUST_SCRIPT_SHA256:
+        raise ValueError("candidate cachebust script is outside the trusted gate")
+    if file_hash(script) != TRUSTED_CACHEBUST_SCRIPT_SHA256:
         raise ValueError("upstream cachebust script checksum mismatch")
-    # require the reviewed upstream asset list
-    if file_hash(file_list) != expected["list_sha256"]:
+    # require both candidate evidence and bytes to match the reviewed filename list
+    if expected.get("list_sha256") != TRUSTED_CACHEBUST_LIST_SHA256:
+        raise ValueError("candidate cachebust list is outside the trusted gate")
+    if file_hash(file_list) != TRUSTED_CACHEBUST_LIST_SHA256:
         raise ValueError("upstream cachebust list checksum mismatch")
     environment = {
         "HOME": "/nonexistent",

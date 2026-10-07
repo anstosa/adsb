@@ -16,9 +16,11 @@ from typing import Any
 from adsb_admin.config import RevisionConflict, ValidationError
 
 ALERT_CATEGORIES = ("military", "medical", "news")
+ALERT_CHANNELS = ("pushover", "email")
 ALERT_SCHEMA_VERSION = 1
 MAX_OVERRIDES = 2_000
 ICAO_PATTERN = re.compile(r"^[0-9A-F]{6}$")
+AIRCRAFT_MODEL_PATTERN = re.compile(r"^[A-Z0-9]{2,4}$")
 HOSTNAME_PATTERN = re.compile(
     r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
@@ -32,6 +34,7 @@ def default_alert_settings() -> dict[str, Any]:
         "revision": 0,
         "enabled": False,
         "categories": list(ALERT_CATEGORIES),
+        "category_channels": {category: list(ALERT_CHANNELS) for category in ALERT_CATEGORIES},
         "pushover": {"app_token": "", "user_key": ""},
         "smtp": {
             "host": "",
@@ -43,6 +46,36 @@ def default_alert_settings() -> dict[str, Any]:
         },
         "overrides": [],
     }
+
+
+# derive dual-channel routes for a legacy selected-category list
+def _legacy_category_channels(categories: Any) -> dict[str, list[str]]:
+    selected = categories if isinstance(categories, list) else ()
+    # route only recognizable selected category names
+    return {category: list(ALERT_CHANNELS) if category in selected else [] for category in ALERT_CATEGORIES}
+
+
+# validate one complete category-to-channel routing map
+def _validated_category_channels(value: Any, fields: dict[str, str]) -> dict[str, list[str]]:
+    normalized = {category: [] for category in ALERT_CATEGORIES}
+    # require every supported category exactly once
+    if not isinstance(value, dict) or frozenset(value) != frozenset(ALERT_CATEGORIES):
+        fields["category_channels"] = "must contain exactly military, medical, and news"
+        return normalized
+    # validate each bounded unique channel list
+    for category in ALERT_CATEGORIES:
+        channels = value[category]
+        # reject unsupported, repeated, or non-array routes
+        if (
+            not isinstance(channels, list)
+            or len(channels) > len(ALERT_CHANNELS)
+            or any(channel not in ALERT_CHANNELS for channel in channels)
+            or len(set(channels)) != len(channels)
+        ):
+            fields[f"category_channels.{category}"] = "must contain unique supported channels"
+            continue
+        normalized[category] = [channel for channel in ALERT_CHANNELS if channel in channels]
+    return normalized
 
 
 # test strict integers
@@ -123,21 +156,31 @@ def _merged_secret(
     return current[name] if validated is None else validated
 
 
-# validate one exact override
+# validate one exact-aircraft or aircraft-model override
 def _override(value: Any, index: int, fields: dict[str, str]) -> dict[str, Any] | None:
     path = f"overrides.{index}"
-    expected = frozenset(("hex", "mode", "categories", "label"))
-    # require an exact object shape
-    if not isinstance(value, dict) or frozenset(value) != expected:
-        fields[path] = "must contain exactly hex, mode, categories, and label"
+    shared = frozenset(("mode", "categories", "label"))
+    # require exactly one supported selector
+    if not isinstance(value, dict) or frozenset(value) not in (shared | {"hex"}, shared | {"model"}):
+        fields[path] = "must contain exactly one of hex or model, plus mode, categories, and label"
         return None
-    hex_id = value["hex"]
-    # normalize only real six-hex identities
-    if not isinstance(hex_id, str) or ICAO_PATTERN.fullmatch(hex_id.upper()) is None:
-        fields[f"{path}.hex"] = "must be a six-character ICAO hex address"
-        normalized_hex = ""
+    selector = "hex" if "hex" in value else "model"
+    selector_value = value[selector]
+    # select the exact-aircraft grammar
+    if selector == "hex":
+        # require one canonical six-hex identity
+        if not isinstance(selector_value, str) or ICAO_PATTERN.fullmatch(selector_value.upper()) is None:
+            fields[f"{path}.hex"] = "must be a six-character ICAO hex address"
+            normalized_selector = ""
+        else:
+            normalized_selector = selector_value.upper()
     else:
-        normalized_hex = hex_id.upper()
+        # require one bounded icao type designator
+        if not isinstance(selector_value, str) or AIRCRAFT_MODEL_PATTERN.fullmatch(selector_value.upper()) is None:
+            fields[f"{path}.model"] = "must be a two-to-four-character ICAO type designator"
+            normalized_selector = ""
+        else:
+            normalized_selector = selector_value.upper()
     mode = value["mode"]
     # restrict override behavior
     if mode not in ("include", "exclude"):
@@ -160,17 +203,23 @@ def _override(value: Any, index: int, fields: dict[str, str]) -> dict[str, Any] 
     if not isinstance(label, str) or len(label) > 100 or any(ord(character) < 32 for character in label):
         fields[f"{path}.label"] = "must be at most 100 printable characters"
         label = ""
-    return {"hex": normalized_hex, "mode": mode, "categories": normalized_categories, "label": label}
+    return {selector: normalized_selector, "mode": mode, "categories": normalized_categories, "label": label}
 
 
 # validate and merge a public settings write
 def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, str] = {}
     expected = frozenset(("revision", "enabled", "categories", "pushover", "smtp", "overrides"))
+    expected_with_routes = expected | {"category_channels"}
     # require the public write contract
-    if not isinstance(payload, dict) or frozenset(payload) != expected:
+    if not isinstance(payload, dict) or frozenset(payload) not in (expected, expected_with_routes):
         raise ValidationError(
-            {"settings": "must contain exactly revision, enabled, categories, pushover, smtp, and overrides"}
+            {
+                "settings": (
+                    "must contain exactly revision, enabled, categories, optional category_channels, "
+                    "pushover, smtp, and overrides"
+                )
+            }
         )
     revision = payload["revision"]
     # require a nonnegative revision
@@ -181,10 +230,9 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
     if not isinstance(enabled, bool):
         fields["enabled"] = "must be a boolean"
     categories = payload["categories"]
-    # require a nonempty unique category subset
+    # require a unique category subset
     if (
         not isinstance(categories, list)
-        or not categories
         or len(categories) > len(ALERT_CATEGORIES)
         or any(category not in ALERT_CATEGORIES for category in categories)
         or len(set(categories)) != len(categories)
@@ -193,6 +241,29 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
         normalized_categories: list[str] = []
     else:
         normalized_categories = [category for category in ALERT_CATEGORIES if category in categories]
+
+    # honor an explicit routing contract or preserve legacy-write intent
+    if "category_channels" in payload:
+        category_channels = _validated_category_channels(payload["category_channels"], fields)
+        routed_categories = [category for category in ALERT_CATEGORIES if category_channels[category]]
+        # keep the compatibility category list equal to routed notification types
+        if routed_categories != normalized_categories:
+            fields["category_channels"] = "nonempty routes must match categories"
+    else:
+        current_categories = set(current.get("categories", ()))
+        current_channels = current.get("category_channels")
+        # derive routes only when the current snapshot itself is legacy
+        if not isinstance(current_channels, dict):
+            current_channels = _legacy_category_channels(current.get("categories"))
+        category_channels = {}
+        # retain existing routes while defaulting newly selected legacy categories to both
+        for category in ALERT_CATEGORIES:
+            if category not in normalized_categories:
+                category_channels[category] = []
+            elif category in current_categories:
+                category_channels[category] = list(current_channels.get(category, ()))
+            else:
+                category_channels[category] = list(ALERT_CHANNELS)
 
     pushover = payload["pushover"]
     allowed_pushover = frozenset(
@@ -262,7 +333,7 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
 
     overrides = payload["overrides"]
     normalized_overrides: list[dict[str, Any]] = []
-    # bound the editable exact-identity list
+    # bound the editable aircraft override list
     if not isinstance(overrides, list) or len(overrides) > MAX_OVERRIDES:
         fields["overrides"] = f"must contain at most {MAX_OVERRIDES} entries"
     else:
@@ -272,24 +343,42 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
             # retain usable normalized rows
             if normalized is not None:
                 normalized_overrides.append(normalized)
-    identities = [entry["hex"] for entry in normalized_overrides]
-    # keep each identity unambiguous
+    identities = [
+        ("hex", entry["hex"]) if "hex" in entry else ("model", entry["model"]) for entry in normalized_overrides
+    ]
+    # keep each selector unambiguous
     if len(identities) != len(set(identities)):
-        fields["overrides"] = "must contain at most one override per ICAO hex address"
+        fields["overrides"] = "must contain at most one override per ICAO hex address or aircraft model"
 
-    # require both complete channels before activation
+    # collapse selected routes for provider-specific credential checks
+    selected_channels = {channel for channels in category_channels.values() for channel in channels}
+    # require at least one route before activation
     if enabled is True:
-        # validate each required private field without echoing its value
-        for path, value in (
-            ("pushover.app_token", merged_pushover["app_token"]),
-            ("pushover.user_key", merged_pushover["user_key"]),
-            ("smtp.host", merged_smtp["host"]),
-            ("smtp.username", merged_smtp["username"]),
-            ("smtp.password", merged_smtp["password"]),
-            ("smtp.from_address", merged_smtp["from_address"]),
-            ("smtp.to_address", merged_smtp["to_address"]),
-        ):
-            # identify only the missing field
+        # reject enabled settings without any notification destination
+        if not selected_channels:
+            fields["category_channels"] = "must select at least one route when alerts are enabled"
+        required_fields: list[tuple[str, Any]] = []
+        # require push credentials only when a selected type uses push
+        if "pushover" in selected_channels:
+            required_fields.extend(
+                (
+                    ("pushover.app_token", merged_pushover["app_token"]),
+                    ("pushover.user_key", merged_pushover["user_key"]),
+                )
+            )
+        # require smtp credentials only when a selected type uses email
+        if "email" in selected_channels:
+            required_fields.extend(
+                (
+                    ("smtp.host", merged_smtp["host"]),
+                    ("smtp.username", merged_smtp["username"]),
+                    ("smtp.password", merged_smtp["password"]),
+                    ("smtp.from_address", merged_smtp["from_address"]),
+                    ("smtp.to_address", merged_smtp["to_address"]),
+                )
+            )
+        # identify each missing selected-channel field without echoing its value
+        for path, value in required_fields:
             if not value:
                 fields[path] = "is required when alerts are enabled"
     # reject all field failures together
@@ -300,6 +389,7 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
         "revision": revision,
         "enabled": enabled,
         "categories": normalized_categories,
+        "category_channels": category_channels,
         "pushover": merged_pushover,
         "smtp": merged_smtp,
         "overrides": normalized_overrides,
@@ -308,10 +398,15 @@ def validate_alert_settings(payload: Any, current: dict[str, Any]) -> dict[str, 
 
 # remove all secret values from an api response
 def redact_alert_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    category_channels = settings.get("category_channels")
+    # project migration routes even before the legacy file is rewritten
+    if "category_channels" not in settings:
+        category_channels = _legacy_category_channels(settings.get("categories"))
     return {
         "revision": settings["revision"],
         "enabled": settings["enabled"],
         "categories": copy.deepcopy(settings["categories"]),
+        "category_channels": copy.deepcopy(category_channels),
         "pushover": {
             "app_token_configured": bool(settings["pushover"]["app_token"]),
             "user_key_configured": bool(settings["pushover"]["user_key"]),
@@ -380,10 +475,11 @@ class AlertSettingsStore:
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise RuntimeError("alert settings file is unreadable") from exc
         expected = frozenset(default_alert_settings())
-        # require the current internal schema
+        legacy_expected = expected - {"category_channels"}
+        # require the current or legacy first-version internal schema
         if (
             not isinstance(value, dict)
-            or frozenset(value) != expected
+            or frozenset(value) not in (expected, legacy_expected)
             or value.get("schema_version") != ALERT_SCHEMA_VERSION
         ):
             raise RuntimeError("alert settings file has an invalid schema")

@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for ADS-B reviewed or requested application updates
+After=adsb-activation-recovery.service
+Requires=adsb-activation-recovery.service
+
+[Path]
+PathChanged=/var/lib/adsb/status/maintenance.json
+PathExists=/var/lib/adsb/config/update-request.json
+Unit=adsb-updater.service
+
+[Install]
+WantedBy=multi-user.target
