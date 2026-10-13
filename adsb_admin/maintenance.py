@@ -1,6 +1,7 @@
 """Bounded maintenance for the receiver's immutable releases."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,7 @@ RETENTION_DAYS = 30
 REPORT_PATH = Path("/var/lib/adsb/status/maintenance.json")
 INSTALLATION_PATH = Path("/var/lib/adsb/status/installation.json")
 CANDIDATE_PATH = Path("/var/lib/adsb/runtime/update-candidates.json")
+ACTIVATION_LOCK_PATH = Path("/run/lock/adsb/activation.lock")
 OS_SCHEDULE = "Tuesdays 04:00 America/Los_Angeles"
 APPLICATION_POLICY = (
     "Clearly compatible updates install automatically; breaking or unknown updates are held for your Install action"
@@ -48,6 +51,12 @@ MAX_REPORT_BYTES = 96 * 1024
 MAX_PRIVATE_CANDIDATE_BYTES = 512 * 1024
 MAX_REMOVED_ARTIFACTS = 100000
 MAX_UPDATES = 7
+MAX_CONTAINER_IDS = 128
+MAX_CONTAINER_MOUNTS = 128
+MAX_DOCKER_LIST_BYTES = 16 * 1024
+MAX_DOCKER_INSPECT_BYTES = 1024 * 1024
+MAX_MOUNTINFO_BYTES = 1024 * 1024
+PROC_ROOT = Path("/proc")
 UPDATE_STATES = frozenset(
     {"available", "held", "queued", "installing", "installed", "failed", "rolled_back", "blocked"}
 )
@@ -907,6 +916,285 @@ def release_time(name: str) -> datetime | None:
         return None
 
 
+# capture bounded docker metadata without retaining arbitrary diagnostics
+def _docker_output(arguments: list[str], *, maximum: int, timeout: int) -> bytes:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        process = subprocess.run(arguments, stdout=output, stderr=errors, timeout=timeout)
+        # fail closed without copying docker diagnostics into maintenance output
+        if process.returncode:
+            raise ValueError("container inspection failed")
+        output.seek(0)
+        raw = output.read(maximum + 1)
+    # reject an unbounded daemon response before parsing it
+    if len(raw) > maximum:
+        raise ValueError("container inspection exceeds size limit")
+    return raw
+
+
+# validate the fixed project's container identities and projected mount state
+def _docker_container_mounts() -> list[tuple[list[str], int]]:
+    listed = _docker_output(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "-aq",
+            "--filter",
+            "label=com.docker.compose.project=adsb",
+        ],
+        maximum=MAX_DOCKER_LIST_BYTES,
+        timeout=10,
+    )
+    try:
+        identifiers = listed.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError("invalid container identities") from error
+    # bound and validate every daemon-selected identity before inspection
+    if (
+        len(identifiers) > MAX_CONTAINER_IDS
+        or len(identifiers) != len(set(identifiers))
+        or any(re.fullmatch(r"[a-f0-9]{12,64}", identifier) is None for identifier in identifiers)
+    ):
+        raise ValueError("invalid container identities")
+    # avoid invoking inspect without an exact selected container
+    if not identifiers:
+        return []
+    inspected = _docker_output(
+        [
+            "/usr/bin/docker",
+            "inspect",
+            "--format",
+            "{{json .Id}}\t{{json .Mounts}}\t{{json .State.Pid}}",
+            *identifiers,
+        ],
+        maximum=MAX_DOCKER_INSPECT_BYTES,
+        timeout=15,
+    )
+    rows = inspected.splitlines()
+    # require one projected record for every selected container
+    if len(rows) != len(identifiers):
+        raise ValueError("invalid container inspection count")
+    result = []
+    # validate all projected fields before trusting any path or pid
+    for expected, raw_row in zip(identifiers, rows, strict=True):
+        fields = raw_row.split(b"\t")
+        # require the exact three-field projection
+        if len(fields) != 3:
+            raise ValueError("invalid container inspection schema")
+        try:
+            identifier, mounts, pid = (json.loads(field) for field in fields)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+            raise ValueError("invalid container inspection schema") from error
+        # bind the returned full identity to its requested abbreviated identity
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(r"[a-f0-9]{64}", identifier) is None
+            or not identifier.startswith(expected)
+            or not isinstance(mounts, list)
+            or len(mounts) > MAX_CONTAINER_MOUNTS
+            or type(pid) is not int
+            or not 0 <= pid <= 2**31 - 1
+        ):
+            raise ValueError("invalid container inspection schema")
+        sources = []
+        # accept only bounded absolute bind sources from each mount envelope
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                raise ValueError("invalid container mount schema")
+            mount_type = mount.get("Type")
+            source = mount.get("Source")
+            try:
+                source_size = len(os.fsencode(source)) if isinstance(source, str) else -1
+            except UnicodeEncodeError as error:
+                raise ValueError("invalid container mount schema") from error
+            # require bounded scalar fields even for ignored mount types
+            if (
+                not isinstance(mount_type, str)
+                or not 0 < len(mount_type) <= 32
+                or not isinstance(source, str)
+                or source_size > 4096
+            ):
+                raise ValueError("invalid container mount schema")
+            # retain only host bind paths for release protection
+            if mount_type == "bind":
+                # reject relative host paths before filesystem comparison
+                if not Path(source).is_absolute():
+                    raise ValueError("invalid container bind source")
+                sources.append(source)
+        result.append((sources, pid))
+    return result
+
+
+# decode the kernel's documented octal path escaping
+def _mountinfo_path(raw: bytes) -> str:
+    try:
+        value = raw.decode("utf-8", errors="surrogateescape")
+        value = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
+        size = len(os.fsencode(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid mountinfo path") from error
+    # require one bounded root value without control bytes
+    if "\x00" in value or size > 4096:
+        raise ValueError("invalid mountinfo path")
+    return value
+
+
+# read one live process mount table with explicit schema and size bounds
+def _kernel_mount_roots(pid: int) -> list[str]:
+    path = PROC_ROOT / str(pid) / "mountinfo"
+    with path.open("rb") as source:
+        raw = source.read(MAX_MOUNTINFO_BYTES + 1)
+    # reject oversized or empty live-process evidence
+    if not raw or len(raw) > MAX_MOUNTINFO_BYTES:
+        raise ValueError("invalid mountinfo size")
+    lines = raw.splitlines()
+    # cap the number of independently parsed kernel mounts
+    if len(lines) > 8192:
+        raise ValueError("invalid mountinfo count")
+    roots = []
+    # validate each kernel record before using any root
+    for line in lines:
+        prefix, separator, suffix = line.partition(b" - ")
+        fields = prefix.split()
+        filesystem = suffix.split()
+        # require the fixed mountinfo fields around the optional-field separator
+        if (
+            not separator
+            or len(fields) < 6
+            or len(filesystem) < 3
+            or not fields[0].isdigit()
+            or not fields[1].isdigit()
+            or re.fullmatch(rb"[0-9]+:[0-9]+", fields[2]) is None
+        ):
+            raise ValueError("invalid mountinfo schema")
+        roots.append(_mountinfo_path(fields[3]))
+    return roots
+
+
+# locate the immutable release containing one trusted absolute mount path
+def _release_from_path(path: Path, root: Path) -> Path | None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return None
+    # reject the root itself and non-installer child names
+    if not relative.parts or release_time(relative.parts[0]) is None:
+        raise ValueError("container references an unmanaged release")
+    release = root / relative.parts[0]
+    # accept only one real managed release directory
+    if not release.is_dir() or release.is_symlink() or release.resolve().parent != root.resolve():
+        raise ValueError("container references an invalid release")
+    return release.resolve()
+
+
+# add application and map releases reached through one container path
+def _protect_container_path(
+    raw_path: str,
+    application: Path,
+    protected_applications: set[Path],
+    protected_maps: set[Path],
+) -> None:
+    path = Path(raw_path)
+    # reject traversal in daemon or kernel path evidence
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("invalid container release path")
+    releases = application / "releases"
+    maps = application / "map-ui-releases"
+    current = application / "current"
+    map_current = application / "map-ui"
+    # preserve the selected app before resolving its nested map symlink
+    try:
+        path.relative_to(current)
+    except ValueError:
+        pass
+    else:
+        protected_applications.add(current.resolve(strict=True))
+        resolved = path.resolve(strict=True)
+        application_release = _release_from_path(resolved, releases)
+        map_release = _release_from_path(resolved, maps)
+        # retain a resolved application tree
+        if application_release is not None:
+            protected_applications.add(application_release)
+        # retain a resolved map tree
+        if map_release is not None:
+            protected_maps.add(map_release)
+        return
+    # resolve the selected map pointer only when it is explicitly referenced
+    try:
+        path.relative_to(map_current)
+    except ValueError:
+        pass
+    else:
+        map_release = _release_from_path(path.resolve(strict=True), maps)
+        # require the public pointer to reach one managed map release
+        if map_release is None:
+            raise ValueError("container references an invalid map release")
+        protected_maps.add(map_release)
+        return
+    application_release = _release_from_path(path, releases)
+    map_release = _release_from_path(path, maps)
+    # retain a direct application path
+    if application_release is not None:
+        protected_applications.add(application_release)
+    # retain a direct map path
+    if map_release is not None:
+        protected_maps.add(map_release)
+
+
+# collect every immutable release referenced by fixed project containers
+def _container_release_references(application: Path) -> tuple[set[Path], set[Path]]:
+    protected_applications: set[Path] = set()
+    protected_maps: set[Path] = set()
+    rows = _docker_container_mounts()
+    # inspect lexical docker sources and live kernel roots before deletion
+    for sources, pid in rows:
+        # protect every projected bind source
+        for source in sources:
+            _protect_container_path(source, application, protected_applications, protected_maps)
+        # stopped containers have no live kernel mount namespace
+        if pid == 0:
+            continue
+        # protect every root in the live mount namespace
+        for root in _kernel_mount_roots(pid):
+            # ignore valid nonpath roots used by namespace pseudo-filesystems
+            if Path(root).is_absolute():
+                _protect_container_path(root, application, protected_applications, protected_maps)
+    return protected_applications, protected_maps
+
+
+# serialize retention with the installer's activation transaction
+@contextmanager
+def _activation_lock(path: Path = ACTIVATION_LOCK_PATH):
+    directory = path.parent
+    directory_metadata = directory.lstat()
+    # require the installer's exact root-private lock directory
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        or directory_metadata.st_uid != 0
+        or directory_metadata.st_gid != 0
+    ):
+        raise ValueError("invalid activation lock directory")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        visible = path.lstat()
+        # bind the descriptor to one exact private regular file
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or visible.st_dev != metadata.st_dev
+            or visible.st_ino != metadata.st_ino
+        ):
+            raise ValueError("invalid activation lock file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 # prune expired artifacts without deleting selected or recent rollback releases
 def prune_releases(application: Path, runtime: Path, *, now: datetime | None = None) -> list[str]:
     current_time = now or datetime.now(timezone.utc)
@@ -932,7 +1220,8 @@ def prune_releases(application: Path, runtime: Path, *, now: datetime | None = N
         if stamp is not None and path.is_dir() and not path.is_symlink():
             entries.append((stamp, path))
     entries.sort(reverse=True)
-    protected = {current.resolve(), *(path.resolve() for _, path in entries[:2])}
+    container_applications, container_maps = _container_release_references(application)
+    protected = {current.resolve(), *(path.resolve() for _, path in entries[:2]), *container_applications}
     removed = []
     # keep the active release and at least two newest rollback candidates
     for stamp, path in entries:
@@ -940,7 +1229,7 @@ def prune_releases(application: Path, runtime: Path, *, now: datetime | None = N
         if stamp < cutoff and path.resolve() not in protected:
             shutil.rmtree(path)
             removed.append(str(path))
-    protected_maps = {(application / "map-ui").resolve()}
+    protected_maps = {(application / "map-ui").resolve(), *container_maps}
     # preserve map assets referenced by every retained application tree
     for path in releases.iterdir():
         map_link = path / "map-ui"
@@ -984,7 +1273,9 @@ def main() -> None:
     try:
         # keep verification runs nondestructive
         if not args.report_only:
-            removed = prune_releases(Path("/opt/adsb"), Path("/var/lib/adsb/runtime"))
+            # keep selection inspection and deletion inside the activation boundary
+            with _activation_lock():
+                removed = prune_releases(Path("/opt/adsb"), Path("/var/lib/adsb/runtime"))
             removed_count = min(len(removed), MAX_REMOVED_ARTIFACTS)
         deploy = Path(__file__).resolve().parents[1] / "deploy"
         candidate_store = discover_candidates(deploy)

@@ -248,7 +248,8 @@ def compose_for(settings, runtime, hardware):
         source_contract = validate_source_contract(runtime["source_contract"])
     station = settings["station"]
     data_dir = runtime["data_dir"]
-    source_dir = runtime["source_dir"]
+    # bind immutable release paths so identical-content updates still recreate containers
+    source_dir = runtime["resolved_source_dir"]
     core = container(runtime, "ultrafeeder", "640m")
     environment = {
         "TZ": "America/Los_Angeles",

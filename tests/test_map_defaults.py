@@ -96,6 +96,7 @@ class MapDefaultsTests(unittest.TestCase):
         self.settings = default_settings()
         self.runtime = {
             "source_dir": "/opt/adsb",
+            "resolved_source_dir": "/opt/adsb/releases/test",
             "data_dir": "/var/lib/adsb",
             "tunnel_enabled": False,
             "images": {

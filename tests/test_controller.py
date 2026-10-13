@@ -291,7 +291,7 @@ class ControllerTests(unittest.TestCase):
         core = compose_for(self.settings, self.runtime, self.absent)["services"]["ultrafeeder"]
         self.assertEqual(core["environment"]["CUSTOM_HTML"], "true")
         self.assertEqual(core["environment"]["UPDATE_TAR1090"], "false")
-        self.assertIn("/opt/adsb/map-ui:/var/custom_html:ro", core["volumes"])
+        self.assertIn("/opt/adsb/releases/test/map-ui:/var/custom_html:ro", core["volumes"])
         self.assertIn("loStore['ui2_optin'] ??= 'true';", core["environment"]["TAR1090_CONFIGJS_APPEND"])
         self.assertIn("window.matchMedia('(max-width: 767px)').matches", core["environment"]["TAR1090_CONFIGJS_APPEND"])
         self.assertIn("loStore['sidebar_visible'] ??= 'false';", core["environment"]["TAR1090_CONFIGJS_APPEND"])
@@ -756,6 +756,49 @@ class ControllerTests(unittest.TestCase):
             self.assertNotEqual(first["map_ui_digest"], second["map_ui_digest"])
             core = compose_for(self.settings, second, self.absent)["services"]["ultrafeeder"]
             self.assertEqual(core["labels"]["station.map-ui.digest"], second["map_ui_digest"])
+
+    # missing immutable resolution must never fall back to a mutable pointer
+    def test_missing_release_resolution_rejects_compose(self):
+        runtime = dict(self.runtime, source_dir="/opt/adsb/current")
+        del runtime["resolved_source_dir"]
+        with self.assertRaises(KeyError):
+            compose_for(self.settings, runtime, self.absent)
+
+    # release switches must refresh binds even when their contents match
+    def test_identical_release_switch_changes_map_and_proxy_mounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pointer = root / "current"
+            releases = []
+            # create separate immutable trees with the same reviewed bytes
+            for name in ("first", "second"):
+                release = root / "releases" / name
+                (release / "deploy/alerts").mkdir(parents=True)
+                (release / "map-ui").mkdir()
+                (release / "deploy/nginx.conf").write_text("same proxy")
+                (release / "map-ui/version.json").write_text('{"commit":"same"}')
+                (release / "deploy/alerts/source-contract.json").write_text(json.dumps(self.runtime["source_contract"]))
+                (release / "deploy/alerts/run-source.sh").write_text("same launcher")
+                (release / "deploy/alerts/source-health.sh").write_text("same health")
+                self.write_source_proof(release)
+                releases.append(release)
+            pointer.symlink_to(releases[0])
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(json.dumps(dict(self.runtime, source_dir=str(pointer))))
+            first = load_runtime(runtime_path)
+            pointer.unlink()
+            pointer.symlink_to(releases[1])
+            second = load_runtime(runtime_path)
+            self.assertEqual(first["map_ui_digest"], second["map_ui_digest"])
+            self.assertEqual(first["proxy_config_digest"], second["proxy_config_digest"])
+            before = compose_for(self.settings, first, self.absent)["services"]
+            after = compose_for(self.settings, second, self.absent)["services"]
+            # verify both mount identities change without touching other services
+            for service in ("ultrafeeder", "proxy"):
+                self.assertNotEqual(before[service]["volumes"], after[service]["volumes"])
+                self.assertNotIn(str(pointer), str(after[service]["volumes"]))
+                self.assertIn(str(releases[1]), str(after[service]["volumes"]))
+            self.assertEqual(after["ultrafeeder"]["environment"], before["ultrafeeder"]["environment"])
 
     # retain useful diagnostics without retaining a secret identifier
     def test_controller_logs_redact_identifiers_and_secrets(self):

@@ -3,9 +3,11 @@
 import io
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -406,6 +408,7 @@ class UpdateReportTests(unittest.TestCase):
                 with (
                     patch.object(maintenance, "REPORT_PATH", path),
                     patch.object(maintenance.os, "geteuid", return_value=0),
+                    patch.object(maintenance, "_activation_lock", return_value=nullcontext()) as activation_lock,
                     patch.object(maintenance, "prune_releases", prune),
                     patch.object(maintenance, "discover_candidates", return_value=candidates),
                     patch.object(maintenance, "write_candidate_store"),
@@ -426,10 +429,63 @@ class UpdateReportTests(unittest.TestCase):
                 self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
                 # preserve report-only nondestructive behavior
                 if "--report-only" in argv:
+                    activation_lock.assert_not_called()
                     prune.assert_not_called()
+                else:
+                    activation_lock.assert_called_once_with()
                 # skip collection when pruning itself failed
                 if prune_error is not None:
                     collect.assert_not_called()
+
+    # hold activation serialization only around retention
+    def test_main_releases_activation_lock_before_discovery(self):
+        events = []
+
+        # record entry and exit around the destructive phase
+        @contextmanager
+        def held_lock():
+            events.append("lock")
+            try:
+                yield
+            finally:
+                events.append("unlock")
+
+        prune = Mock(side_effect=lambda *_: events.append("prune") or [])
+        discover = Mock(side_effect=lambda *_: events.append("discover") or {"candidates": []})
+        with (
+            patch.object(maintenance.os, "geteuid", return_value=0),
+            patch.object(maintenance, "_activation_lock", side_effect=held_lock),
+            patch.object(maintenance, "prune_releases", prune),
+            patch.object(maintenance, "discover_candidates", discover),
+            patch.object(maintenance, "write_candidate_store"),
+            patch.object(maintenance, "collect_report", return_value={"status": "ok"}),
+            patch.object(maintenance, "_write_report"),
+            patch("sys.argv", ["maintenance"]),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            maintenance.main()
+        self.assertEqual(events, ["lock", "prune", "unlock", "discover"])
+
+    # reject an invalid activation boundary before pruning or discovery
+    def test_main_fails_closed_before_prune_when_activation_lock_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "maintenance.json"
+            prune = Mock()
+            discover = Mock()
+            with (
+                patch.object(maintenance, "REPORT_PATH", path),
+                patch.object(maintenance.os, "geteuid", return_value=0),
+                patch.object(maintenance, "_activation_lock", side_effect=ValueError("invalid lock")),
+                patch.object(maintenance, "prune_releases", prune),
+                patch.object(maintenance, "discover_candidates", discover),
+                patch("sys.argv", ["maintenance"]),
+                patch("sys.stdout", new_callable=io.StringIO),
+                self.assertRaises(SystemExit),
+            ):
+                maintenance.main()
+            prune.assert_not_called()
+            discover.assert_not_called()
+            self.assertEqual(json.loads(path.read_text())["status"], "failed")
 
     # keep weekly schedules and security-only policy explicit and reviewable
     def test_weekly_policy_has_no_automatic_reboot_or_mutable_deployment(self):
@@ -455,6 +511,35 @@ class RetentionTests(unittest.TestCase):
         (application / "map-ui").symlink_to(map_release)
         return application, map_release
 
+    # return one projected docker inspection row
+    def docker_inspection(self, identifier, mounts, pid):
+        return f"{json.dumps(identifier)}\t{json.dumps(mounts)}\t{json.dumps(pid)}\n".encode()
+
+    # render one minimal kernel mount record
+    def mount_record(self, root, target):
+        return f"36 25 8:1 {root} {target} ro - ext4 /dev/sda rw\n"
+
+    # open and lock only the installer's existing private file
+    def test_activation_lock_uses_read_only_validated_descriptor(self):
+        directory = Mock(st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0)
+        lock = Mock(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0, st_nlink=1, st_dev=8, st_ino=9)
+        path = Path("/run/lock/adsb/activation.lock")
+        with (
+            patch.object(Path, "lstat", side_effect=[directory, lock]),
+            patch.object(maintenance.os, "open", return_value=17) as opened,
+            patch.object(maintenance.os, "fstat", return_value=lock),
+            patch.object(maintenance.fcntl, "flock") as flock,
+            patch.object(maintenance.os, "close") as close,
+            maintenance._activation_lock(path),
+        ):
+            pass
+        opened.assert_called_once_with(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        flock.assert_called_once_with(17, maintenance.fcntl.LOCK_EX)
+        close.assert_called_once_with(17)
+
     # preserve selected releases and two newest versions regardless of age
     def test_retention_preserves_active_recent_and_unmanaged_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -473,7 +558,8 @@ class RetentionTests(unittest.TestCase):
             archive.touch()
             private = runtime / "compose.json"
             private.write_text("private configuration")
-            removed = prune_releases(root, runtime, now=datetime(2026, 9, 8, tzinfo=timezone.utc))
+            with patch.object(maintenance, "_container_release_references", return_value=(set(), set())):
+                removed = prune_releases(root, runtime, now=datetime(2026, 9, 8, tzinfo=timezone.utc))
             self.assertEqual(set(removed), {str(old), str(old_map), str(archive)})
             # retained rollback artifacts and private files remain intact
             for path in (active, active_map, rollback, rollback_map, newest, newest_map, unmanaged, private):
@@ -507,11 +593,163 @@ class RetentionTests(unittest.TestCase):
             (root / "releases/20260101T000000Z-1").symlink_to(foreign)
             (root / "map-ui-releases/20260101T000000Z-1").symlink_to(foreign)
             (runtime / "code-20260101T000000Z-1.tar.gz").symlink_to(foreign / "important")
-            removed = prune_releases(root, runtime, now=datetime(2026, 9, 8, tzinfo=timezone.utc))
+            with patch.object(maintenance, "_container_release_references", return_value=(set(), set())):
+                removed = prune_releases(root, runtime, now=datetime(2026, 9, 8, tzinfo=timezone.utc))
             self.assertEqual(removed, [])
             self.assertTrue(boundary.exists())
             self.assertTrue(boundary_map.exists())
             self.assertTrue((foreign / "important").exists())
+
+    # retain every immutable tree still mounted by an adsb container
+    def test_retention_preserves_live_kernel_roots_and_expires_unmounted_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            live_app, live_app_map = self.make_release(root, "20260101T000000Z-1")
+            live_map_app, live_map = self.make_release(root, "20260102T000000Z-1")
+            expired, expired_map = self.make_release(root, "20260103T000000Z-1")
+            rollback, rollback_map = self.make_release(root, "20260901T000000Z-1")
+            active, active_map = self.make_release(root, "20260902T000000Z-1")
+            newest, newest_map = self.make_release(root, "20260903T000000Z-1")
+            (live_app / "deploy").mkdir()
+            (live_app / "deploy/nginx.conf").touch()
+            (root / "current").symlink_to(active)
+            (root / "map-ui").symlink_to(active_map)
+            identifier = "a" * 64
+            foreign = root / "foreign"
+            foreign.mkdir()
+            (foreign / "important").touch()
+            mounts = [
+                {"Type": "bind", "Source": str(root / "current/map-ui")},
+                {"Type": "bind", "Source": str(foreign)},
+            ]
+            proc = root / "proc"
+            (proc / "123").mkdir(parents=True)
+            (proc / "123/mountinfo").write_text(
+                self.mount_record(live_app / "deploy/nginx.conf", "/etc/nginx/nginx.conf")
+                + self.mount_record(live_map, "/var/custom_html")
+                + self.mount_record(foreign, "/var/lib/foreign")
+                + self.mount_record("net:[4026531833]", "/run/docker/netns/default")
+            )
+            archive = runtime / "code-20260103T000000Z-1.tar.gz"
+            archive.touch()
+            listed = f"{identifier}\n".encode()
+            inspected = self.docker_inspection(identifier, mounts, 123)
+            with (
+                patch.object(maintenance, "PROC_ROOT", proc),
+                patch.object(
+                    maintenance,
+                    "_docker_output",
+                    side_effect=[listed, inspected, listed, inspected],
+                ) as docker_output,
+            ):
+                protected_apps, protected_maps = maintenance._container_release_references(root)
+                removed = prune_releases(root, runtime, now=datetime(2026, 9, 8, tzinfo=timezone.utc))
+            self.assertEqual(protected_apps, {active.resolve(), live_app.resolve()})
+            self.assertEqual(protected_maps, {active_map.resolve(), live_map.resolve()})
+            self.assertEqual(set(removed), {str(live_map_app), str(expired), str(expired_map), str(archive)})
+            self.assertEqual(
+                docker_output.call_args_list[0].args[0],
+                [
+                    "/usr/bin/docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=com.docker.compose.project=adsb",
+                ],
+            )
+            self.assertEqual(
+                docker_output.call_args_list[1].args[0][1:4],
+                ["inspect", "--format", "{{json .Id}}\t{{json .Mounts}}\t{{json .State.Pid}}"],
+            )
+            # preserve both application and standalone map mount roots
+            for path in (
+                live_app,
+                live_app_map,
+                live_map,
+                rollback,
+                rollback_map,
+                active,
+                active_map,
+                newest,
+                newest_map,
+                foreign / "important",
+            ):
+                self.assertTrue(path.exists())
+
+    # abort before deleting anything when docker or proc evidence is unavailable
+    def test_retention_fails_closed_on_container_inspection_errors(self):
+        # cover docker command failure and a stale positive container pid
+        for stale_pid in (False, True):
+            with self.subTest(stale_pid=stale_pid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = root / "runtime"
+                runtime.mkdir()
+                old, old_map = self.make_release(root, "20260101T000000Z-1")
+                self.make_release(root, "20260901T000000Z-1")
+                active, active_map = self.make_release(root, "20260902T000000Z-1")
+                self.make_release(root, "20260903T000000Z-1")
+                (root / "current").symlink_to(active)
+                (root / "map-ui").symlink_to(active_map)
+                archive = runtime / "code-20260101T000000Z-1.tar.gz"
+                archive.touch()
+                identifier = "b" * 64
+                outputs = [
+                    f"{identifier}\n".encode(),
+                    self.docker_inspection(identifier, [{"Type": "bind", "Source": str(root / "current")}], 991),
+                ]
+                effect = outputs if stale_pid else OSError("docker unavailable")
+                with (
+                    patch.object(maintenance, "PROC_ROOT", root / "empty-proc"),
+                    patch.object(maintenance, "_docker_output", side_effect=effect),
+                    self.assertRaises((OSError, ValueError)),
+                ):
+                    prune_releases(root, runtime, now=datetime(2026, 10, 13, tzinfo=timezone.utc))
+                # failures occur before application map or archive deletion
+                for path in (old, old_map, archive):
+                    self.assertTrue(path.exists())
+
+    # reject malformed or unbounded docker projections before pruning
+    def test_container_inspection_validates_ids_counts_schema_and_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identifier = "c" * 64
+            cases = (
+                (b"bad-id\n", b""),
+                (f"{identifier}\n{identifier}\n".encode(), b""),
+                (f"{identifier}\n".encode(), b""),
+                (f"{identifier}\n".encode(), self.docker_inspection("d" * 64, [], 0)),
+                (f"{identifier}\n".encode(), self.docker_inspection(identifier, {}, 0)),
+                (
+                    f"{identifier}\n".encode(),
+                    self.docker_inspection(identifier, [{}] * (maintenance.MAX_CONTAINER_MOUNTS + 1), 0),
+                ),
+            )
+            # validate every external identity and projection boundary
+            for listed, inspected in cases:
+                with (
+                    self.subTest(listed=listed[:20], inspected=inspected[:20]),
+                    patch.object(maintenance, "_docker_output", side_effect=[listed, inspected]),
+                    self.assertRaises(ValueError),
+                ):
+                    maintenance._container_release_references(root)
+
+    # bound docker output before parsing daemon-controlled metadata
+    def test_docker_output_rejects_failure_and_oversized_output(self):
+        # simulate command failure and a response one byte above its budget
+        for returncode, payload in ((1, b""), (0, b"12345")):
+            # write one controlled command result into the supplied capture file
+            def run(_arguments, *, stdout, stderr, timeout):
+                stdout.write(payload)
+                return Mock(returncode=returncode)
+
+            with (
+                self.subTest(returncode=returncode, payload=payload),
+                patch.object(maintenance.subprocess, "run", side_effect=run),
+                self.assertRaises(ValueError),
+            ):
+                maintenance._docker_output(["docker"], maximum=4, timeout=1)
 
     # leave invalid dates and foreign names untouched
     def test_only_installer_names_are_recognized(self):
