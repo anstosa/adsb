@@ -2,6 +2,9 @@
 
 **Safe, observable aircraft tracking and alerts from locally received radio data**
 
+<img width="2752" height="2064" alt="adsb ballydidean farm_map_(iPad Pro 13)" src="https://github.com/user-attachments/assets/bb662c20-2729-407f-abd2-0fc57a01a522" />
+
+
 **Technical white paper · Ansel Santosa**
 
 [Deployment target](https://adsb.ballydidean.farm/map/) · [Architecture](#2-architecture-and-safety) · [Verification](#6-verification) · [Operations](#7-operations-and-rollback)
