@@ -1,10 +1,31 @@
-# Ballydidean Farm ADS-B station
+# Ballydídean ADS-B Station
 
-Receiver software for an Airspy Mini (1090 MHz) and an ADSBx Orange RTL-SDR (978 MHz), with safe hardware-free staging. The public map is at `/map/`; password-protected configuration and reception diagnostics are at `/admin`.
+**Safe, observable aircraft tracking and alerts from locally received radio data**
 
-**Production target:** <https://adsb.ballydidean.farm/admin>. This URL is not evidence of deployment: verify it after installing the origin and enabling its dedicated Cloudflare Tunnel.
+**Technical white paper · Ansel Santosa**
 
-## Supported networks
+[Deployment target](https://adsb.ballydidean.farm/map/) · [Architecture](#2-architecture-and-safety) · [Verification](#6-verification) · [Operations](#7-operations-and-rollback)
+
+## At a glance
+
+| | |
+| --- | --- |
+| **Product** | A locally operated ADS-B receiver, aircraft map, guarded administration console, and configurable notifications for selected aircraft categories. |
+| **Engineering challenge** | Separate actual radio reception from network-derived data, distinguish enabled settings from applied configuration, and protect services from unsafe or partial deployments. |
+| **Technical scope** | Python service, root-owned deployment controller, Docker Compose, readsb/tar1090, Airspy 1090 MHz and RTL-SDR 978 MHz receivers, Cloudflare Tunnel, SQLite alert state, and SMTP/Pushover integrations. |
+| **Design principle** | Observable state and bounded control matter more than a superficially green status indicator. Hardware presence, feed connectivity, and message reception are different facts. |
+
+The sections below explain implemented controls, system boundaries, verification, and explicit commissioning limits.
+
+## Abstract
+
+This project provides a configurable ADS-B receiving station and monitoring interface for Ballydídean Farm. It combines local 1090 MHz and 978 MHz radio sources with aircraft visualization, selectively enabled network feeds, reception diagnostics, and opt-in alerts based on physically received nearby aircraft.
+
+The central engineering concern is safely operating a hardware-dependent, externally connected system. An unprivileged web service is separated from deployment authority; a restricted controller validates configuration and applies known container definitions. Observability distinguishes source silence, failure, stale inputs, and absent hardware, while bounded alert queues and per-encounter logic limit notification noise.
+
+**Operational status:** The published administration URL is a deployment target, not proof that the station has been commissioned or its radio feeds verified. The hardware and production checks below remain authoritative.
+
+## 1. Supported networks
 
 - ADS-B Exchange
 - FlightAware / PiAware
@@ -15,7 +36,7 @@ FR24 is deliberately excluded. All networks start disabled. Each network has an 
 
 Fill the station name, actual antenna latitude/longitude, and elevation in metres before enabling a feed. Saved UUIDs are masked and never returned by the settings API. Leaving a replacement field unchanged preserves the stored identifier; direct-feed clear controls remove their IDs. FlightAware's generated identity remains in its private PiAware cache rather than being treated as an operator-generated credential.
 
-## Architecture and safety
+## 2. Architecture and safety
 
 - The Python standard-library web service runs as a dedicated `adsb` user. It cannot access Docker or modify application code.
 - A separate root-owned controller revalidates settings and generates a fixed Docker Compose specification. The UI cannot choose commands, images, destinations, paths, or arbitrary environment variables.
@@ -125,7 +146,7 @@ The local map uses Airplanes.live's experimental UI from [tar1090's public `prod
 
 Ultrafeeder serves this read-only bundle through its supported `CUSTOM_HTML` mount. Preparation disables the upstream global-aggregator default before cachebusting, so its normal local receiver data, history, generated station configuration, and image-pinned aircraft database remain in use; this does not display Airplanes.live's global traffic or enable its feed. The config/database symlinks depend on the pinned ultrafeeder image and must be revalidated when updating that image. Map tiles and optional aircraft imagery can still load from their upstream providers. Runtime UI updates remain disabled.
 
-## Files and persistent state
+## 3. Files and persistent state
 
 | Path | Purpose |
 | --- | --- |
@@ -153,7 +174,7 @@ Ultrafeeder serves this read-only bundle through its supported `CUSTOM_HTML` mou
 
 Do not copy these private files into Git. `deploy/images.json` pins all container images by digest; automatic and manual changes create newly validated immutable releases rather than running mutable tags.
 
-## Install on the receiver
+## 4. Installation and configuration
 
 Prerequisites: Ubuntu 24.04 amd64, SSH access, authorized sudo, outbound package/image access, and approximately 2 GiB RAM. The installer does not reboot, reinstall the OS, modify storage, or change unrelated services.
 
@@ -182,7 +203,7 @@ The value must be one canonical HTTPS origin on the default port. Paths, credent
 
 Partitioned storage means the embedded admin and a standalone tab have separate login sessions. Use a current Chromium browser or Safari 26.2+, whose partitioned-cookie support is described in [WebKit Features in Safari 26.2](https://webkit.org/blog/17640/webkit-features-for-safari-26-2/). In an older browser, an embedded login may remain unauthenticated; use the existing **Open** action and log in in the new tab instead.
 
-## Enable the production tunnel
+## 5. Production network boundary
 
 Use the authenticated operator-side `cloudflared` CLI to create a dedicated tunnel, keeping credentials outside Git:
 
@@ -204,7 +225,7 @@ cloudflared tunnel route dns TUNNEL_UUID adsb.ballydidean.farm
 
 Verify the exact resulting hostname, tunnel identity, external HTTPS certificate, map assets, unauthorized API rejection, and authenticated admin flows. A DNS record alone is not a successful deployment. The tunnel publishes the web application, not raw ADS-B or MLAT ports.
 
-## Validation
+## 6. Verification
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -234,7 +255,7 @@ ADSB_PROXY_TEST_URL=https://adsb.ballydidean.farm python3 -m unittest discover -
 
 Both `/` and `/map` must redirect to relative `/map/`, without leaking the private origin's HTTP scheme or port.
 
-## Operations and rollback
+## 7. Operations and rollback
 
 ### Encrypted off-host backups
 
@@ -281,8 +302,22 @@ The RemoteAgents project combines these commands with `externalUrl: "https://ads
 
 Installation stages an exact immutable application tree, prepares its matching map assets, and atomically updates `/opt/adsb/current`. Map and proxy containers bind the exact application-release path rather than the mutable pointer, so every release switch refreshes these mounts even when the map version or proxy contents are unchanged. A random activation identity prevents a fresh status from the previous controller from satisfying the new release's readiness gate. Installation also preserves a timestamped application-code archive in `/var/lib/adsb/runtime/` before selection. To roll back: stop `adsb-alerts` and `adsb-controller`, atomically repoint `/opt/adsb/current` to the previous directory under `/opt/adsb/releases`, restore the corresponding reviewed runtime image pins when necessary, and restart `adsb-admin` and `adsb-controller`. Restart `adsb-alerts` only when the selected release includes the worker and matching source contract; disable the new unit when reverting to a pre-alert release. The selected application release includes its matching map-release link. Weekly maintenance expires installer-owned artifacts after 30 days while protecting the selected release, two newest application releases, referenced maps, and releases mounted by existing ADS-B containers; off-host backups follow their separate retention policy. Keep private settings and tunnel credentials intact. Stop the fixed `adsb` Compose project if immediate shutdown is needed; do not stop unrelated containers.
 
-## Hardware commissioning remains required
+## 8. Hardware commissioning and limitations
 
 When radios arrive, verify serial assignment and driver ownership, both decoder processes, actual aircraft/message recency, Airspy CPU/thermal margin, UAT traffic, suitable gain, and the LNA/bias-tee power arrangement. No bias-tee enablement is guessed by this deployment. Confirm each provider's station acceptance and MLAT synchronization separately. Repeated host reboot reliability was historically unresolved and is not certified by service-level tests.
 
 Upstream contracts: [ultrafeeder](https://github.com/sdr-enthusiasts/docker-adsb-ultrafeeder), [PiAware](https://github.com/sdr-enthusiasts/docker-piaware), [Airspy](https://github.com/sdr-enthusiasts/airspy_adsb), [dump978](https://github.com/sdr-enthusiasts/docker-dump978), [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/).
+
+
+## Resources
+
+- [Public map deployment target](https://adsb.ballydidean.farm/map/)
+- [Admin deployment target](https://adsb.ballydidean.farm/admin)
+- [Deployment scripts and source](deploy/)
+- [Optional Remote Agent Console integration](https://github.com/anstosa/remoteagents)
+
+## Project background
+
+Receiver software for an Airspy Mini (1090 MHz) and an ADSBx Orange RTL-SDR (978 MHz), with safe hardware-free staging. The public map is at `/map/`; password-protected configuration and reception diagnostics are at `/admin`.
+
+**Production target:** <https://adsb.ballydidean.farm/admin>. This URL is not evidence of deployment: verify it after installing the origin and enabling its dedicated Cloudflare Tunnel.
