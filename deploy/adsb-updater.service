@@ -17,6 +17,8 @@ Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=true
 PrivateDevices=true
+# systemd-analyze verify uses a fixed /tmp path
+PrivateTmp=true
 ProtectControlGroups=true
 ProtectHome=true
 ProtectKernelModules=true

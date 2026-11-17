@@ -74,6 +74,22 @@ class UpdateWorkerTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("NoNewPrivileges=true", unit)
 
+    # give systemd's verifier writable scratch without exposing the host tmp
+    def test_service_unit_verification_has_private_tmp(self):
+        unit = (Path(__file__).parents[1] / "deploy/adsb-updater.service").read_text()
+        self.assertIn("PrivateTmp=true", unit.splitlines())
+
+    # keep docker proof bind sources visible to the daemon outside private tmp
+    def test_update_commands_use_host_visible_private_scratch(self):
+        with (
+            patch.object(update_worker.Path, "mkdir"),
+            patch.object(update_worker.Path, "chmod"),
+            patch.object(update_worker.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run,
+        ):
+            update_worker._run_command(["/usr/bin/true"], cwd=Path("/opt/adsb/current"))
+
+        self.assertEqual(run.call_args.kwargs["env"]["TMPDIR"], str(update_worker.RUNTIME_ROOT))
+
     # stage every selected pin together while leaving unselected components intact
     def test_manual_batch_stages_one_release_with_only_selected_targets(self):
         first = candidate()

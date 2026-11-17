@@ -439,6 +439,8 @@ def _run_command(
         "LC_ALL": "C",
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "DOCKER_CONFIG": "/run/adsb-updater/docker",
+        # docker's daemon must see proof bind sources outside the service's private tmp
+        "TMPDIR": str(RUNTIME_ROOT),
     }
     docker_config = Path(environment["DOCKER_CONFIG"])
     docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
