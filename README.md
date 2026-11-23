@@ -34,16 +34,17 @@ The central engineering concern is safely operating a hardware-dependent, extern
 - FlightAware / PiAware
 - ADSB.lol
 - Airplanes.live
+- map.flights
 
-FR24 is deliberately excluded. All networks start disabled. Each network has an enabled switch, optional MLAT switch, and stable feeder UUID input. The admin page can generate local UUIDs for the three direct-feed networks; generation does not register a network account. FlightAware is different: PiAware must obtain a provider-issued ID after its first connection, which can then be [claimed](https://www.flightaware.com/adsb/piaware/claim) or replaced with an existing FlightAware ID when preserving a registered site.
+FR24 is deliberately excluded. All networks start disabled. Each network has an enabled switch, optional MLAT switch, and stable feeder UUID input. The admin page can generate local UUIDs for ADS-B Exchange, ADSB.lol, and Airplanes.live; generation does not register a network account. FlightAware can obtain a PiAware ID on connection and [claim](https://www.flightaware.com/adsb/piaware/claim) it. map.flights uses a station UUID issued by the provider.
 
-Fill the station name, actual antenna latitude/longitude, and elevation in metres before enabling a feed. Saved UUIDs are masked and never returned by the settings API. Leaving a replacement field unchanged preserves the stored identifier; direct-feed clear controls remove their IDs. FlightAware's generated identity remains in its private PiAware cache rather than being treated as an operator-generated credential.
+Fill the station name, actual antenna latitude/longitude, and elevation in metres before enabling a feed. Saved UUIDs are masked and never returned by the settings API. Leaving a replacement field unchanged preserves the stored identifier; direct-feed clear controls remove their IDs. FlightAware's generated identity remains in its private PiAware cache.
 
 ## 2. Architecture and safety
 
 - The Python standard-library web service runs as a dedicated `adsb` user. It cannot access Docker or modify application code.
 - A separate root-owned controller revalidates settings and generates a fixed Docker Compose specification. The UI cannot choose commands, images, destinations, paths, or arbitrary environment variables.
-- One ultrafeeder instance supplies `readsb`, `tar1090`, and the three direct network connectors. PiAware runs separately only when requested and receiver hardware is present.
+- One ultrafeeder instance supplies `readsb`, `tar1090`, and the direct network connectors. PiAware runs separately only when requested and receiver hardware is present.
 - Airspy and dump978 containers start only when exactly one supported receiver of the corresponding type is detected. A detected serial is passed to the decoder. Multiple matching devices are not selected arbitrarily.
 - No radio means no outbound uploaders, even if a switch has been enabled in advance. There is no production fixture input or simulated-aircraft generator.
 - Only the loopback HTTP proxy is published by Cloudflare Tunnel. Raw receiver ports, Docker, and metrics are not public.
@@ -194,6 +195,13 @@ For a new site, leave the FlightAware feeder ID blank, enable the feed, and save
 
 Enter a FlightAware feeder ID manually only when importing an existing registered site. The value must be the site's FlightAware-issued **Unique Identifier**; an arbitrary UUID will connect to the service but cannot create or claim a valid site. Do not clear PiAware's private cache during ordinary upgrades.
 
+### Enroll map.flights
+
+1. Before storing any map.flights settings, verify that the active ADS-B-only Framework backup adapter accepts both the historical four-network schema and the fifth network with the matching immutable settings marker. The compatibility patch is `deploy/backup/framework-map-flights.patch`; it applies separately from the earlier ADS-B backup setup patch. Test archive verification on a disposable copy before any approved Framework update. Do not proceed on the strength of a local patch alone.
+2. Once the active verifier passes, attest compatibility on the receiver by installing a regular `root:root`, mode `0644` file at `/etc/adsb/map-flights-backup-ready`, containing exactly `mapflights-settings-v2` followed by one newline. The installer does not create this non-secret attestation. Revalidate it after verifier changes or recovery; it is not a credential or an archived setting. Without it, Admin prevents new provisioning but still allows disabling or clearing the feed. The controller holds only the map.flights feed and MLAT until readiness is attested, preserving saved settings and other feeds.
+3. Create a station using the [map.flights feeder guide](https://map.flights/stations/build). Enter its UUID in authenticated **Admin → Outbound sharing → map.flights**, and enable the feed and MLAT. No second UUID or connection is necessary for 978 UAT. The raw feed combines 1090 and 978; MLAT uses the physical 1090 receiver and sends the existing antenna location and elevation to map.flights.
+4. Wait for the saved revision to apply, then verify recent received data and MLAT participation on the provider station profile. The [feed checker](https://map.flights/myfeed) from the receiver's network corroborates receipt, not station attribution. The [combined Beast path](https://map.flights/zh-hant/stations/uat978) does not expose a separate provider-side 978 count; confirm local UAT reception separately. MLAT may participate before nearby peers yield a fix.
+
 ### Optional RemoteAgents embedding
 
 Embedding is disabled by default: responses use `frame-ancestors 'none'`, `X-Frame-Options: DENY`, and the standalone `SameSite=Strict` session cookie. To permit this site inside one trusted RemoteAgents origin, add the following to the private `/etc/adsb/admin.env` and restart `adsb-admin`:
@@ -236,8 +244,10 @@ python3 -m compileall -q adsb_admin
 ruff check adsb_admin tests
 ruff format --check adsb_admin tests
 node --check web/admin.js
-bash -n deploy/install.sh deploy/release-transaction.sh deploy/enable-tunnel.sh deploy/remote-stack.sh
-shellcheck deploy/install.sh deploy/release-transaction.sh deploy/enable-tunnel.sh deploy/remote-stack.sh
+(for script in deploy/install.sh deploy/release-transaction.sh deploy/rollback-map-flights.sh \
+    deploy/enable-tunnel.sh deploy/remote-stack.sh; do bash -n "$script" || exit 1; done)
+shellcheck deploy/install.sh deploy/release-transaction.sh deploy/rollback-map-flights.sh \
+  deploy/enable-tunnel.sh deploy/remote-stack.sh
 ```
 
 Use a private, separate settings directory for browser/integration tests. A local HTTP test server must opt into `--insecure-cookie` and an exact local `--origin`; do not use that flag in production. Never send recorded/synthetic data to provider endpoints.
@@ -304,6 +314,8 @@ Status checks systemd, containers, the origin, fresh controller state, and Cloud
 The RemoteAgents project combines these commands with `externalUrl: "https://adsb.ballydidean.farm"`, not a fictitious local proxy port. Open and split view target the production site directly; external previews offer viewport sizing without proxy-based device emulation. The hostname must resolve and its Cloudflare tunnel must be healthy before the public preview works. Admin embedding additionally requires the exact `ADSB_ADMIN_FRAME_ORIGIN` opt-in above; the **Open** action remains the fallback for browsers without partitioned-cookie support.
 
 Installation stages an exact immutable application tree, prepares its matching map assets, and atomically updates `/opt/adsb/current`. Map and proxy containers bind the exact application-release path rather than the mutable pointer, so every release switch refreshes these mounts even when the map version or proxy contents are unchanged. A random activation identity prevents a fresh status from the previous controller from satisfying the new release's readiness gate. Installation also preserves a timestamped application-code archive in `/var/lib/adsb/runtime/` before selection. To roll back: stop `adsb-alerts` and `adsb-controller`, atomically repoint `/opt/adsb/current` to the previous directory under `/opt/adsb/releases`, restore the corresponding reviewed runtime image pins when necessary, and restart `adsb-admin` and `adsb-controller`. Restart `adsb-alerts` only when the selected release includes the worker and matching source contract; disable the new unit when reverting to a pre-alert release. The selected application release includes its matching map-release link. Weekly maintenance expires installer-owned artifacts after 30 days while protecting the selected release, two newest application releases, referenced maps, and releases mounted by existing ADS-B containers; off-host backups follow their separate retention policy. Keep private settings and tunnel credentials intact. Stop the fixed `adsb` Compose project if immediate shutdown is needed; do not stop unrelated containers.
+
+To roll back from a provisioned map.flights release to an approved pre-feature release, use `sudo /opt/adsb/current/deploy/rollback-map-flights.sh RELEASE`, with the retained release's directory name, instead of manually repointing the symlink. This serializes the downgrade with the settings writer stopped, removes only the map.flights record from the latest settings, and validates the preceding release before bringing it up. It requires that the previous release's pinned images are already cached. Reenter the provider UUID privately to recommission the feed.
 
 ## 8. Hardware commissioning and limitations
 

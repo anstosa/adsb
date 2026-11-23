@@ -56,6 +56,157 @@ prepare_activation_lock() {
 }
 
 
+# project the latest private settings to the legacy network schema
+project_mapflights_settings() {
+    local root=$1
+    local current_source=$2
+    local target_source=$3
+    local settings="$root/var/lib/adsb/config/settings.json"
+    python3 -B - "$settings" "$root" "$current_source" "$target_source" <<'PY'
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+settings = Path(sys.argv[1])
+root_raw = sys.argv[2]
+sources = tuple(Path(raw) for raw in sys.argv[3:])
+expected_uid = os.getuid() if root_raw else pwd.getpwnam("adsb").pw_uid
+expected_gid = os.getgid() if root_raw else pwd.getpwnam("adsb").pw_gid
+legacy_networks = {"adsbexchange", "flightaware", "adsblol", "airplaneslive"}
+map_uuid = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+
+# reject duplicate keys at every private-settings depth
+def unique_object(pairs: list[tuple[str, object]]) -> dict:
+    value = dict(pairs)
+    # duplicate JSON keys cannot be projected without changing meaning
+    if len(value) != len(pairs):
+        raise ValueError("settings file contains duplicate keys")
+    return value
+
+
+# require one canonical UUID without changing legacy provider policy
+def legacy_uuid(value: object) -> bool:
+    # blank identifiers remain valid for providers that allow them
+    if value == "":
+        return True
+    # normalized UUID text must round-trip exactly
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+reader = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from adsb_admin.config import SettingsStore
+from adsb_admin.controller import read_settings
+path = Path(sys.argv[2])
+SettingsStore(path)
+read_settings(path)
+"""
+
+
+# require both independent readers from one immutable application release
+def validate_release(source: Path, path: Path) -> None:
+    subprocess.run(
+        [sys.executable, "-I", "-B", "-c", reader, str(source), str(path)],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+descriptor = os.open(settings, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+# require the fixed private regular file before reading any credential bytes
+with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+    metadata = os.fstat(stream.fileno())
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size > 64 * 1024
+    ):
+        raise ValueError("settings file metadata is invalid")
+    content = stream.read(64 * 1024 + 1)
+    # catch growth after the bounded metadata observation
+    if len(content) > 64 * 1024:
+        raise ValueError("settings file is too large")
+value = json.loads(content, object_pairs_hook=unique_object)
+# validate the complete top-level private contract before removing one provider
+if not isinstance(value, dict) or set(value) != {"revision", "station", "networks"}:
+    raise ValueError("settings file schema is invalid")
+if type(value["revision"]) is not int or value["revision"] < 0:
+    raise ValueError("settings revision is invalid")
+station = value["station"]
+if not isinstance(station, dict) or set(station) != {"name", "latitude", "longitude", "altitude_m"}:
+    raise ValueError("station settings are invalid")
+networks = value["networks"]
+if not isinstance(networks, dict) or set(networks) not in (legacy_networks, legacy_networks | {"mapflights"}):
+    raise ValueError("network settings are invalid")
+# validate every stored provider record before retaining it
+for name, network in networks.items():
+    if not isinstance(network, dict) or set(network) != {"enabled", "mlat", "feeder_id"}:
+        raise ValueError("provider settings are invalid")
+    if type(network["enabled"]) is not bool or type(network["mlat"]) is not bool:
+        raise ValueError("provider switches are invalid")
+    identifier = network["feeder_id"]
+    # map.flights uses the stricter cross-consumer identity contract
+    if name == "mapflights":
+        if identifier != "" and (not isinstance(identifier, str) or map_uuid.fullmatch(identifier) is None):
+            raise ValueError("map.flights identity is invalid")
+        if network["enabled"] and not identifier:
+            raise ValueError("enabled map.flights settings lack an identity")
+        if network["mlat"] and not network["enabled"]:
+            raise ValueError("map.flights MLAT requires the base feed")
+    elif not legacy_uuid(identifier):
+        raise ValueError("provider identity is invalid")
+
+# require the active release to accept the latest unmodified source document
+validate_release(sources[0], settings)
+# remove only the new optional provider from the latest validated document
+networks.pop("mapflights", None)
+temporary = settings.with_name(f".{settings.name}.{os.getpid()}.mapflights-rollback")
+descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    # require both sides of the release transition to accept the exact candidate bytes
+    for source in sources:
+        validate_release(source, temporary)
+    os.replace(temporary, settings)
+    directory = os.open(settings.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    # remove only an unselected candidate without retaining credential bytes
+    if temporary.exists():
+        temporary.unlink()
+PY
+}
+
+
 # keep maintenance host files in the same activation transaction as the application
 MAINTENANCE_ARTIFACTS=(
     '/etc/systemd/system/adsb-maintenance.service|adsb-maintenance.service'

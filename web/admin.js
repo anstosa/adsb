@@ -1,6 +1,7 @@
 "use strict";
 
-const NETWORK_IDS = ["adsbexchange", "flightaware", "adsblol", "airplaneslive"];
+const NETWORK_IDS = ["adsbexchange", "flightaware", "adsblol", "airplaneslive", "mapflights"];
+const LOCALLY_GENERATED_FEEDER_IDS = new Set(["adsbexchange", "adsblol", "airplaneslive"]);
 const ALERT_CATEGORIES = ["military", "medical", "news"];
 const ALERT_CHANNELS = ["pushover", "email"];
 const MAX_ALERT_OVERRIDES = 2000;
@@ -42,7 +43,8 @@ const FIELD_ERROR_IDS = {
   "station.name": "station-name",
   "station.latitude": "station-latitude",
   "station.longitude": "station-longitude",
-  "station.altitude_m": "station-altitude"
+  "station.altitude_m": "station-altitude",
+  "networks.mapflights.feeder_id": "mapflights-feeder-id"
 };
 const MAINTENANCE_POLICY = "Clearly compatible updates install automatically; breaking or unknown updates are held for your Install action";
 const UPDATE_COMPATIBILITY_LABELS = {
@@ -232,6 +234,11 @@ function handleNetworkToggle(event) {
   clearSaveMessage();
 }
 
+// name the private provider identity without implying local registration
+function feederIdentityLabel(networkId) {
+  return networkId === "mapflights" ? "station UUID" : "feeder ID";
+}
+
 // note a replacement feeder id
 function handleFeederInput(event) {
   const networkId = event.currentTarget.dataset.networkId;
@@ -240,7 +247,7 @@ function handleFeederInput(event) {
   // send only nonempty replacements
   if (value) {
     feederActions.set(networkId, "replace");
-    element(`${networkId}-feeder-hint`).textContent = "New feeder ID will replace the saved value";
+    element(`${networkId}-feeder-hint`).textContent = `New ${feederIdentityLabel(networkId)} will replace the saved value`;
     element(`${networkId}-clear`).textContent = "Discard replacement";
     element(`${networkId}-clear`).hidden = false;
   } else {
@@ -275,11 +282,12 @@ function handleGenerateFeeder(event) {
 function restoreFeederHint(networkId) {
   const input = element(`${networkId}-feeder-id`);
   const configured = input.dataset.configured === "true";
+  const identityLabel = feederIdentityLabel(networkId);
   input.value = "";
   element(`${networkId}-feeder-hint`).textContent = configured
-    ? "Saved feeder ID: ••••••••"
-    : "No feeder ID is configured";
-  element(`${networkId}-clear`).textContent = "Clear saved feeder ID";
+    ? `Saved ${identityLabel}: ••••••••`
+    : `No ${identityLabel} is configured`;
+  element(`${networkId}-clear`).textContent = `Clear saved ${identityLabel}`;
   element(`${networkId}-clear`).hidden = !configured || networkId === "flightaware";
 }
 
@@ -300,7 +308,7 @@ function handleClearFeeder(event) {
   } else {
     feederActions.set(networkId, "clear");
     element(`${networkId}-feeder-id`).value = "";
-    element(`${networkId}-feeder-hint`).textContent = "Saved feeder ID will be cleared";
+    element(`${networkId}-feeder-hint`).textContent = `Saved ${feederIdentityLabel(networkId)} will be cleared`;
     element(`${networkId}-clear`).textContent = "Undo clear";
     element(`${networkId}-clear`).hidden = false;
   }
@@ -1405,15 +1413,32 @@ function collectConfig() {
       mlat: element(`${networkId}-mlat`).checked
     };
     const feederAction = feederActions.get(networkId);
+    const feederInput = element(`${networkId}-feeder-id`);
 
     // include an explicit replacement only
     if (feederAction === "replace") {
-      network.feeder_id = element(`${networkId}-feeder-id`).value.trim();
+      const replacement = feederInput.value.trim();
+      network.feeder_id = networkId === "mapflights" ? replacement.toLowerCase() : replacement;
     }
 
     // include an explicit clear only
     if (feederAction === "clear") {
       network.feeder_id = "";
+    }
+
+    // require the provider-issued identity before requesting map.flights egress
+    if (networkId === "mapflights" && network.enabled) {
+      const configured = feederInput.dataset.configured === "true";
+      const hasIdentity = feederAction === "replace" || (configured && feederAction !== "clear");
+      // stop before an incomplete attributed feed reaches the server
+      if (!hasIdentity) {
+        throw new Error("Enter the provider-issued map.flights station UUID before enabling this feed.");
+      }
+    }
+
+    // keep MLAT dependent on the matching base feed even under scripted form changes
+    if (networkId === "mapflights" && network.mlat && !network.enabled) {
+      throw new Error("Enable the map.flights feed before enabling map.flights MLAT.");
     }
 
     networks[networkId] = network;
@@ -2756,7 +2781,7 @@ function bindEvents() {
     feederInput.addEventListener("input", handleFeederInput);
     clearButton.addEventListener("click", handleClearFeeder);
     // bind local UUID generation only for compatible providers
-    if (networkId !== "flightaware") {
+    if (LOCALLY_GENERATED_FEEDER_IDS.has(networkId)) {
       const generateButton = element(`${networkId}-generate`);
       generateButton.dataset.networkId = networkId;
       generateButton.addEventListener("click", handleGenerateFeeder);

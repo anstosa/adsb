@@ -9,6 +9,7 @@ import mimetypes
 import posixpath
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
@@ -120,6 +121,7 @@ class AdminApplication:
         frame_origin: str | None = None,
         sessions: SessionStore | None = None,
         rate_limiter: LoginRateLimiter | None = None,
+        mapflights_ready: Callable[[], bool] | None = None,
     ) -> None:
         normalized_origin = origin.rstrip("/")
         parsed_origin = urlsplit(normalized_origin)
@@ -142,7 +144,7 @@ class AdminApplication:
         if normalized_frame_origin is not None and not secure_cookie:
             raise ValueError("embedded sessions require secure cookies")
         self.web_root = web_root.resolve()
-        self.settings = SettingsStore(settings_path)
+        self.settings = SettingsStore(settings_path, mapflights_ready=mapflights_ready)
         self.alerts = AlertAdmin(settings_path, status_path)
         self.updates = UpdateAdmin(settings_path, status_path)
         self.status_path = status_path

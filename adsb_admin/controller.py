@@ -15,17 +15,22 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import UUID
 
+from adsb_admin.config import mapflights_ready
 from adsb_admin.diagnostics import ReceptionMonitor
 from adsb_admin.map_defaults import VIEW_DEFAULTS, config_js
 
-NETWORKS = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
+LEGACY_NETWORKS = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
+NETWORKS = (*LEGACY_NETWORKS, "mapflights")
+MAPFLIGHTS_DEFAULT = {"enabled": False, "mlat": False, "feeder_id": ""}
 DESTINATIONS = {
     "adsbexchange": ("feed1.adsbexchange.com", "feed.adsbexchange.com", 39008),
     "adsblol": ("in.adsb.lol", "in.adsb.lol", 39009),
     "airplaneslive": ("feed.airplanes.live", "feed.airplanes.live", 39010),
+    "mapflights": ("feed.map.flights", "mlat.map.flights", None),
 }
 IMAGE_PATTERN = re.compile(r"^[a-z0-9./_-]+@sha256:[a-f0-9]{64}$")
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+MAPFLIGHTS_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 ACTIVATION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 AUXILIARY_SOURCE_SERVICES = frozenset(("alert-source-1090", "alert-source-978fallback"))
 MANAGED_SERVICES = (
@@ -67,11 +72,12 @@ def validate_settings(value):
             type(number) not in (int, float) or not math.isfinite(number) or not lower <= number <= upper
         ):
             raise ValueError("invalid station coordinates")
-    # allow only the four supported networks
-    if not isinstance(value["networks"], dict) or set(value["networks"]) != set(NETWORKS):
+    networks = value["networks"]
+    # admit only the exact legacy or configured provider shape
+    if not isinstance(networks, dict) or networks.keys() not in (set(LEGACY_NETWORKS), set(NETWORKS)):
         raise ValueError("unsupported network")
     # accept only known switches and UUID identifiers
-    for name, network in value["networks"].items():
+    for name, network in networks.items():
         # reject extra per-network options
         if not isinstance(network, dict) or set(network) != {"enabled", "mlat", "feeder_id"}:
             raise ValueError("invalid network structure")
@@ -81,15 +87,26 @@ def validate_settings(value):
         # require textual receiver identifiers
         if not isinstance(network["feeder_id"], str):
             raise ValueError("invalid feeder identifier")
-        # validate each nonempty identifier
-        if network["feeder_id"]:
+        # require the stored map.flights identity to match the backup contract
+        if name == "mapflights":
+            # reject noncanonical identifiers without echoing them
+            if network["feeder_id"] and not MAPFLIGHTS_UUID_PATTERN.fullmatch(network["feeder_id"]):
+                raise ValueError("invalid map.flights station identifier")
+            # reject MLAT without the base feed
+            if network["mlat"] and not network["enabled"]:
+                raise ValueError("map.flights MLAT requires the base feed")
+        # retain the legacy identifier grammar
+        elif network["feeder_id"]:
             UUID(network["feeder_id"])
         # require actual antenna coordinates for feeds
         if network["enabled"] and any(station[key] is None for key in ("latitude", "longitude", "altitude_m")):
             raise ValueError("station location is required before enabling a feed")
         # preserve stable identities for networks that require them
-        if network["enabled"] and name in ("adsbexchange", "adsblol") and not network["feeder_id"]:
+        if network["enabled"] and name in ("adsbexchange", "adsblol", "mapflights") and not network["feeder_id"]:
             raise ValueError("a stable feeder identifier is required")
+    # normalize sparse legacy settings without changing the caller's snapshot
+    if "mapflights" not in networks:
+        return {**value, "networks": {**networks, "mapflights": dict(MAPFLIGHTS_DEFAULT)}}
     return value
 
 
@@ -240,8 +257,8 @@ def alert_source_container(runtime, band, source):
 
 
 # render only fixed services and destinations from validated settings
-def compose_for(settings, runtime, hardware):
-    validate_settings(settings)
+def compose_for(settings, runtime, hardware, *, mapflights_attested=False):
+    settings = validate_settings(settings)
     source_contract = None
     # require the immutable source contract only when a physical source can be rendered
     if (hardware["airspy"] or hardware["uat"]) and runtime.get("source_contract") is not None:
@@ -350,13 +367,21 @@ def compose_for(settings, runtime, hardware):
     # hardware absence is an additional safeguard against fixture egress
     for name, (host, mlat_host, return_port) in DESTINATIONS.items():
         network = settings["networks"][name]
+        # fence only map.flights at the privileged egress boundary
+        if name == "mapflights" and not mapflights_attested:
+            continue
         # activate only requested feeds with real hardware
         if network["enabled"] and (hardware["airspy"] or hardware["uat"]):
             identifier = f",uuid={network['feeder_id']}" if network["feeder_id"] else ""
             connectors.append(f"adsb,{host},30004,beast_reduce_plus_out{identifier}")
             # gate MLAT independently on the 1090 receiver
             if network["mlat"] and hardware["airspy"]:
-                connectors.append(f"mlat,{mlat_host},31090,{return_port}{identifier}")
+                # give map.flights only the physical 1090 stream and no extra result listener
+                if return_port is None:
+                    connectors.append(f"mlat,{mlat_host},31090{identifier},input_connect=airspy:30005")
+                # preserve the established connector arguments for existing networks
+                else:
+                    connectors.append(f"mlat,{mlat_host},31090,{return_port}{identifier}")
     environment["ULTRAFEEDER_CONFIG"] = ";".join(connectors)
     core.update(
         {
@@ -1018,25 +1043,33 @@ def status_for(
     activation_id="",
     reception=None,
     alerts=None,
+    *,
+    mapflights_attested=False,
 ):
     available = hardware["airspy"] or hardware["uat"]
     networks = {}
     # expose only nonsecret operational details
     for name in NETWORKS:
-        enabled = settings["networks"][name]["enabled"]
+        enabled = settings["networks"].get(name, MAPFLIGHTS_DEFAULT)["enabled"]
         message = "Disabled; no uploader configured."
         connected = False
         process_running = False
+        # retain the requested state while reporting a backup readiness hold
+        if enabled and name == "mapflights" and not mapflights_attested:
+            message = "Feed paused until backup verifier compatibility is confirmed."
         # keep requested feeds waiting without a receiver
-        if enabled and not available:
+        elif enabled and not available:
             message = "Enabled in settings; waiting for physical receiver hardware."
         elif enabled:
             process_running = ("piaware" if name == "flightaware" else "ultrafeeder") in running
             # use connector telemetry only for direct feed destinations
             if name in DESTINATIONS:
                 connected = tcp_connected(metrics, DESTINATIONS[name][0]) if process_running else False
+                # distinguish a stopped map.flights uploader from a pending socket
+                if name == "mapflights" and not process_running:
+                    message = "Uploader is not running."
                 # distinguish telemetry loss from confirmed socket state
-                if connected is None:
+                elif connected is None:
                     message = "Uploader running; connector telemetry unavailable."
                 else:
                     message = (
@@ -1044,6 +1077,9 @@ def status_for(
                         if connected
                         else "Configured; awaiting network connection."
                     )
+                # distinguish requested MLAT without the physical 1090 receiver
+                if name == "mapflights" and settings["networks"][name]["mlat"] and not hardware["airspy"]:
+                    message += " MLAT is waiting for the 1090 MHz receiver."
             else:
                 connected = None
                 # describe FlightAware enrollment separately from process state
@@ -1105,7 +1141,11 @@ def main():
             status_path = data / "status/status.json"
             settings = read_settings(settings_path)
             hardware = detect_hardware()
-            specification = compose_for(settings, runtime, hardware)
+            # recheck readiness each poll without changing the saved configuration
+            mapflights_attested = settings["networks"].get("mapflights", MAPFLIGHTS_DEFAULT)["enabled"] and (
+                mapflights_ready()
+            )
+            specification = compose_for(settings, runtime, hardware, mapflights_attested=mapflights_attested)
             digest = hashlib.sha256(json.dumps(specification, sort_keys=True).encode()).hexdigest()
             # apply only changed deployment specifications
             if digest != last_digest:
@@ -1135,6 +1175,7 @@ def main():
                 activation_id,
                 reception,
                 alerts,
+                mapflights_attested=mapflights_attested,
             )
             expected_services = set(specification["services"])
             core_services = expected_services - AUXILIARY_SOURCE_SERVICES

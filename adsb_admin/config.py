@@ -7,21 +7,28 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-NETWORK_NAMES = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
+LEGACY_NETWORK_NAMES = ("adsbexchange", "flightaware", "adsblol", "airplaneslive")
+MAPFLIGHTS_NETWORK_NAME = "mapflights"
+NETWORK_NAMES = (*LEGACY_NETWORK_NAMES, MAPFLIGHTS_NETWORK_NAME)
 STATION_KEYS = frozenset(("name", "latitude", "longitude", "altitude_m"))
 PUBLIC_NETWORK_KEYS = frozenset(("enabled", "mlat", "feeder_id", "feeder_id_configured"))
 STATUS_PHASES = frozenset(("starting", "ready", "error", "waiting"))
 RECEPTION_BANDS = ("1090", "978")
 RECEPTION_STATES = frozenset(("absent", "stopped", "unavailable", "stale", "monitoring", "quiet", "receiving"))
 STATION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
-REQUIRED_FEEDER_IDS = frozenset(("adsbexchange", "adsblol"))
+REQUIRED_FEEDER_IDS = frozenset(("adsbexchange", "adsblol", MAPFLIGHTS_NETWORK_NAME))
+MAPFLIGHTS_UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+MAPFLIGHTS_BACKUP_ERROR = "Backup verifier compatibility must be confirmed before configuring map.flights."
+MAPFLIGHTS_BACKUP_ATTESTATION = Path("/etc/adsb/map-flights-backup-ready")
+MAPFLIGHTS_BACKUP_ATTESTATION_CONTENT = b"mapflights-settings-v2\n"
 STATUS_FRESHNESS_SECONDS = 30
 MAX_MESSAGES_PER_MINUTE = 10_000_000
 UNKNOWN_STATUS_MESSAGE = "controller status stale or unknown"
@@ -29,6 +36,26 @@ FLIGHTAWARE_CLAIM_URL_PATTERN = re.compile(
     r"^https://www\.flightaware\.com/adsb/piaware/claim/"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+
+# require an operator-attested backup verifier before configuring or running map.flights
+def mapflights_ready(path: Path = MAPFLIGHTS_BACKUP_ATTESTATION) -> bool:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            # reject unprivileged or unexpected attestations
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_size != len(MAPFLIGHTS_BACKUP_ATTESTATION_CONTENT)
+            ):
+                return False
+            return stream.read(len(MAPFLIGHTS_BACKUP_ATTESTATION_CONTENT) + 1) == MAPFLIGHTS_BACKUP_ATTESTATION_CONTENT
+    except OSError:
+        return False
 
 
 # represent schema-validation failures
@@ -47,7 +74,7 @@ class RevisionConflict(Exception):
         self.current = current
 
 
-# build safe initial settings
+# build the sparse, legacy-compatible initial settings
 def default_settings() -> dict[str, Any]:
     return {
         "revision": 0,
@@ -59,6 +86,29 @@ def default_settings() -> dict[str, Any]:
             "airplaneslive": {"enabled": False, "mlat": False, "feeder_id": ""},
         },
     }
+
+
+# build the optional provider's private default
+def _mapflights_default() -> dict[str, Any]:
+    return {"enabled": False, "mlat": False, "feeder_id": ""}
+
+
+# normalize one supported persisted network collection for internal use
+def _normalize_persisted_networks(networks: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(networks)
+    # synthesize only the exact optional default for a legacy document
+    if frozenset(normalized) == frozenset(LEGACY_NETWORK_NAMES):
+        normalized[MAPFLIGHTS_NETWORK_NAME] = _mapflights_default()
+    return normalized
+
+
+# compact the optional default before writing legacy-compatible bytes
+def _persisted_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    persisted = copy.deepcopy(settings)
+    # omit only the exact inert record
+    if persisted["networks"].get(MAPFLIGHTS_NETWORK_NAME) == _mapflights_default():
+        del persisted["networks"][MAPFLIGHTS_NETWORK_NAME]
+    return persisted
 
 
 # test a strict integer value
@@ -130,6 +180,36 @@ def _validate_feeder_id(value: Any, path: str, fields: dict[str, str]) -> str | 
         return None
 
 
+# validate one provider-issued canonical station identifier
+def _validate_mapflights_feeder_id(value: Any, path: str, fields: dict[str, str]) -> str | None:
+    # accept harmless operator whitespace and case only at the api boundary
+    if not isinstance(value, str):
+        fields[path] = "must be a canonical UUID or blank"
+        return None
+    normalized = value.strip().lower()
+    # preserve an explicit clear operation
+    if not normalized:
+        return ""
+    # keep the stored and restore-verifier grammar identical
+    if MAPFLIGHTS_UUID_PATTERN.fullmatch(normalized) is None:
+        fields[path] = "must be a canonical UUID or blank"
+        return None
+    return normalized
+
+
+# test whether a blocked provider transition only reduces outbound activity
+def _is_safe_mapflights_reduction(current: dict[str, Any], proposed: dict[str, Any]) -> bool:
+    # allow an exact preserve or a full disable-and-clear transition
+    if proposed == current or proposed == _mapflights_default():
+        return True
+    # retain the credential while allowing only active switches to turn off
+    return (
+        proposed["feeder_id"] == current["feeder_id"]
+        and not (current["enabled"] is False and proposed["enabled"] is True)
+        and not (current["mlat"] is False and proposed["mlat"] is True)
+    )
+
+
 # validate a complete settings replacement
 def validate_settings(payload: Any, current: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, str] = {}
@@ -191,7 +271,11 @@ def validate_settings(payload: Any, current: dict[str, Any]) -> dict[str, Any]:
             feeder_id = preserved_id
             # validate an explicitly supplied credential
             if "feeder_id" in network:
-                validated_id = _validate_feeder_id(network["feeder_id"], f"{path}.feeder_id", fields)
+                # constrain map.flights to the restore verifier's provider-id contract
+                validator = (
+                    _validate_mapflights_feeder_id if network_name == MAPFLIGHTS_NETWORK_NAME else _validate_feeder_id
+                )
+                validated_id = validator(network["feeder_id"], f"{path}.feeder_id", fields)
                 # use the new value only when valid
                 if validated_id is not None:
                     feeder_id = validated_id
@@ -199,6 +283,9 @@ def validate_settings(payload: Any, current: dict[str, Any]) -> dict[str, Any]:
             # require credentials for networks that cannot self-register safely
             if enabled is True and network_name in REQUIRED_FEEDER_IDS and not feeder_id:
                 fields[f"{path}.feeder_id"] = "is required when this network is enabled"
+            # keep the optional mlat route subordinate to its base feed
+            if network_name == MAPFLIGHTS_NETWORK_NAME and mlat is True and enabled is not True:
+                fields[f"{path}.mlat"] = "requires this network to be enabled"
             # track whether station fields become mandatory
             if enabled is True:
                 any_enabled = True
@@ -258,9 +345,10 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
 # own persistent settings with optimistic concurrency
 class SettingsStore:
     # initialize or load persistent settings
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, mapflights_ready: Callable[[], bool] | None = None) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._mapflights_ready = mapflights_ready
         # initialize a missing file once
         if not self.path.exists():
             _atomic_write(self.path, default_settings())
@@ -277,18 +365,22 @@ class SettingsStore:
         if not isinstance(value, dict) or frozenset(value) != frozenset(("revision", "station", "networks")):
             raise RuntimeError("settings file has an invalid schema")
         networks = value.get("networks")
-        # require the complete provider collection before normalization
-        if not isinstance(networks, dict) or frozenset(networks) != frozenset(NETWORK_NAMES):
+        # accept only the exact legacy or current provider collection
+        valid_network_sets = (frozenset(LEGACY_NETWORK_NAMES), frozenset(NETWORK_NAMES))
+        if not isinstance(networks, dict) or frozenset(networks) not in valid_network_sets:
             raise RuntimeError("settings file has an invalid schema")
         # require stored credentials to remain explicit
         for network in networks.values():
             # reject partial private records
             if not isinstance(network, dict) or frozenset(network) != frozenset(("enabled", "mlat", "feeder_id")):
                 raise RuntimeError("settings file has an invalid schema")
+        normalized_value = copy.deepcopy(value)
+        normalized_value["networks"] = _normalize_persisted_networks(networks)
         current_template = default_settings()
+        current_template["networks"] = _normalize_persisted_networks(current_template["networks"])
         # validate the persisted shape without preserving generated defaults
         try:
-            validated = validate_settings(value, current_template)
+            validated = validate_settings(normalized_value, current_template)
         except ValidationError as exc:
             raise RuntimeError("settings file has an invalid schema") from exc
         validated["revision"] = value["revision"]
@@ -314,8 +406,17 @@ class SettingsStore:
             if payload["revision"] != self._settings["revision"]:
                 raise RevisionConflict(redact_settings(self._settings))
             validated = validate_settings(payload, self._settings)
+            current_mapflights = self._settings["networks"][MAPFLIGHTS_NETWORK_NAME]
+            proposed_mapflights = validated["networks"][MAPFLIGHTS_NETWORK_NAME]
+            # enforce the production backup gate without blocking safe shutdown
+            if (
+                self._mapflights_ready is not None
+                and not _is_safe_mapflights_reduction(current_mapflights, proposed_mapflights)
+                and not self._mapflights_ready()
+            ):
+                raise ValidationError({f"networks.{MAPFLIGHTS_NETWORK_NAME}.feeder_id": MAPFLIGHTS_BACKUP_ERROR})
             validated["revision"] = self._settings["revision"] + 1
-            _atomic_write(self.path, validated)
+            _atomic_write(self.path, _persisted_settings(validated))
             self._settings = validated
             return redact_settings(self._settings)
 

@@ -16,7 +16,15 @@ from unittest.mock import patch
 
 from adsb_admin.__main__ import _parser
 from adsb_admin.auth import LoginRateLimiter, make_password_hash
-from adsb_admin.config import NETWORK_NAMES, UNKNOWN_STATUS_MESSAGE, SettingsStore, sanitized_status
+from adsb_admin.config import (
+    LEGACY_NETWORK_NAMES,
+    MAPFLIGHTS_BACKUP_ERROR,
+    NETWORK_NAMES,
+    UNKNOWN_STATUS_MESSAGE,
+    SettingsStore,
+    ValidationError,
+    sanitized_status,
+)
 from adsb_admin.server import (
     EMBEDDED_SESSION_COOKIE_NAME,
     MAX_BODY_BYTES,
@@ -645,6 +653,123 @@ class AdminServerTest(unittest.TestCase):
         self.assertEqual(feeder_id, private["networks"]["adsbexchange"]["feeder_id"])
         self.assertEqual(0o600, self.settings_path.stat().st_mode & 0o777)
 
+    # keep a default fifth provider compatible with legacy settings readers
+    def test_mapflights_default_is_sparse_and_normalized_without_rewrite(self) -> None:
+        initial_bytes = self.settings_path.read_bytes()
+        private = self.server.application.settings.get_private()
+        public = self.server.application.settings.get_public()
+        self.assertEqual(set(LEGACY_NETWORK_NAMES), set(json.loads(initial_bytes)["networks"]))
+        self.assertEqual(
+            {"enabled": False, "mlat": False, "feeder_id": ""},
+            private["networks"]["mapflights"],
+        )
+        self.assertEqual(
+            {"enabled": False, "mlat": False, "feeder_id_configured": False},
+            public["networks"]["mapflights"],
+        )
+        self.assertEqual(initial_bytes, self.settings_path.read_bytes())
+
+        cookie, csrf = self.login()
+        status, _, _ = self.json_request(
+            "PUT",
+            "/api/admin/config",
+            payload=self.valid_settings(),
+            headers={"Origin": TEST_ORIGIN, "Cookie": cookie, "X-CSRF-Token": csrf},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(set(LEGACY_NETWORK_NAMES), set(json.loads(self.settings_path.read_text())["networks"]))
+
+    # persist and redact one provider-issued canonical station id
+    def test_mapflights_id_is_canonical_private_and_clear_compacts(self) -> None:
+        cookie, csrf = self.login()
+        headers = {"Origin": TEST_ORIGIN, "Cookie": cookie, "X-CSRF-Token": csrf}
+        canonical = "d35c1a7c-63f9-4cb2-a1c0-bfe272e59f43"
+        configured = self.valid_settings()
+        configured["networks"]["mapflights"] = {
+            "enabled": True,
+            "mlat": True,
+            "feeder_id": f"  {canonical.upper()}  ",
+        }
+        status, _, payload = self.json_request("PUT", "/api/admin/config", payload=configured, headers=headers)
+        self.assertEqual(200, status)
+        self.assertTrue(payload["networks"]["mapflights"]["feeder_id_configured"])
+        self.assertNotIn(canonical, json.dumps(payload))
+        private = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(canonical, private["networks"]["mapflights"]["feeder_id"])
+
+        cleared = self.valid_settings(revision=1)
+        cleared["networks"]["mapflights"]["feeder_id"] = ""
+        status, _, payload = self.json_request("PUT", "/api/admin/config", payload=cleared, headers=headers)
+        self.assertEqual(200, status)
+        self.assertFalse(payload["networks"]["mapflights"]["feeder_id_configured"])
+        self.assertEqual(set(LEGACY_NETWORK_NAMES), set(json.loads(self.settings_path.read_text())["networks"]))
+
+    # reject identifiers outside the provider and backup-verifier contract
+    def test_mapflights_rejects_noncanonical_ids_and_orphan_mlat(self) -> None:
+        cookie, csrf = self.login()
+        headers = {"Origin": TEST_ORIGIN, "Cookie": cookie, "X-CSRF-Token": csrf}
+        # exercise each structural uuid mismatch independently
+        for feeder_id in (
+            "d35c1a7c63f94cb2a1c0bfe272e59f43",
+            "d35c1a7c-63f9-0cb2-a1c0-bfe272e59f43",
+            "d35c1a7c-63f9-4cb2-71c0-bfe272e59f43",
+        ):
+            settings = self.valid_settings()
+            settings["networks"]["mapflights"]["feeder_id"] = feeder_id
+            status, _, payload = self.json_request("PUT", "/api/admin/config", payload=settings, headers=headers)
+            self.assertEqual(422, status)
+            self.assertEqual(
+                "must be a canonical UUID or blank",
+                payload["fields"]["networks.mapflights.feeder_id"],
+            )
+        settings = self.valid_settings()
+        settings["networks"]["mapflights"]["mlat"] = True
+        status, _, payload = self.json_request("PUT", "/api/admin/config", payload=settings, headers=headers)
+        self.assertEqual(422, status)
+        self.assertEqual("requires this network to be enabled", payload["fields"]["networks.mapflights.mlat"])
+
+    # enforce backup readiness while retaining fail-safe shutdown transitions
+    def test_mapflights_backup_gate_blocks_configuration_but_allows_shutdown(self) -> None:
+        path = self.root / "config" / "gated-settings.json"
+        blocked = SettingsStore(path, mapflights_ready=lambda: False)
+        configured = self.valid_settings()
+        configured["networks"]["mapflights"] = {
+            "enabled": True,
+            "mlat": True,
+            "feeder_id": "d35c1a7c-63f9-4cb2-a1c0-bfe272e59f43",
+        }
+        with self.assertRaises(ValidationError) as context:
+            blocked.update(configured)
+        self.assertEqual(
+            MAPFLIGHTS_BACKUP_ERROR,
+            context.exception.fields["networks.mapflights.feeder_id"],
+        )
+
+        ready = SettingsStore(path, mapflights_ready=lambda: True)
+        ready.update(configured)
+        blocked = SettingsStore(path, mapflights_ready=lambda: False)
+        disabled = self.valid_settings(revision=1)
+        disabled["networks"]["mapflights"] = {"enabled": False, "mlat": False}
+        blocked.update(disabled)
+        private = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            configured["networks"]["mapflights"]["feeder_id"], private["networks"]["mapflights"]["feeder_id"]
+        )
+
+        reenabled = self.valid_settings(revision=2)
+        reenabled["networks"]["mapflights"] = {"enabled": True, "mlat": False}
+        with self.assertRaises(ValidationError) as context:
+            blocked.update(reenabled)
+        self.assertEqual(
+            MAPFLIGHTS_BACKUP_ERROR,
+            context.exception.fields["networks.mapflights.feeder_id"],
+        )
+
+        cleared = self.valid_settings(revision=2)
+        cleared["networks"]["mapflights"]["feeder_id"] = ""
+        blocked.update(cleared)
+        self.assertEqual(set(LEGACY_NETWORK_NAMES), set(json.loads(path.read_text())["networks"]))
+
     # verify omitted ids preserve and empty ids clear credentials
     def test_feeder_id_omission_preserves_and_empty_clears(self) -> None:
         cookie, csrf = self.login()
@@ -936,7 +1061,8 @@ class AdminServerTest(unittest.TestCase):
 
     # verify settings survive application restart without regenerating ids
     def test_restart_preserves_settings_and_generated_ids(self) -> None:
-        initial = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        initial_bytes = self.settings_path.read_bytes()
+        initial = self.server.application.settings.get_private()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -954,6 +1080,7 @@ class AdminServerTest(unittest.TestCase):
         self.address = self.server.server_address
         reloaded = restarted_application.settings.get_private()
         self.assertEqual(initial, reloaded)
+        self.assertEqual(initial_bytes, self.settings_path.read_bytes())
 
 
 # verify throttling separately with a small deterministic limit

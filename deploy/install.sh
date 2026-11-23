@@ -8,25 +8,37 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+LIVE_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SOURCE_DIR=$LIVE_SOURCE_DIR
 INSTALL_MODE=install
 ADMIN_ENV=""
+ROLLBACK_SOURCE_RELEASE=""
 # accept only one documented installer mode
 if [[ $# -eq 1 && $1 == --update ]]; then
     INSTALL_MODE=update
     ADMIN_ENV=/etc/adsb/admin.env
 elif [[ $# -eq 1 && $1 == --recover-only ]]; then
     INSTALL_MODE=recover
+# accept one bounded prior immutable release for the schema downgrade
+elif [[ $# -eq 2 && $1 == --rollback-map-flights ]]; then
+    INSTALL_MODE=rollback-map-flights
+    ADMIN_ENV=/etc/adsb/admin.env
+    # release names never carry paths or shell syntax
+    if [[ ! $2 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]; then
+        printf '%s\n' 'map.flights rollback release name is invalid' >&2
+        exit 64
+    fi
+    ROLLBACK_SOURCE_RELEASE="/opt/adsb/releases/$2"
 elif [[ $# -eq 1 && $1 != --* ]]; then
     ADMIN_ENV=$1
 else
-    printf '%s\n' 'usage: install.sh ADMIN_ENV | --update | --recover-only' >&2
+    printf '%s\n' 'usage: install.sh ADMIN_ENV | --update | --recover-only | --rollback-map-flights RELEASE' >&2
     exit 64
 fi
 
 # load fixed transaction and recovery operations before taking the global lock
 # shellcheck source=deploy/release-transaction.sh
-source "$SOURCE_DIR/deploy/release-transaction.sh"
+source "$LIVE_SOURCE_DIR/deploy/release-transaction.sh"
 
 # skip only a validated live activation when systemd starts boot recovery
 if [[ "$INSTALL_MODE" == recover && ${ADSB_BOOT_RECOVERY:-0} == 1 ]]; then
@@ -51,6 +63,36 @@ if [[ "$INSTALL_MODE" == recover ]]; then
     exit 0
 fi
 
+# resolve the requested immutable rollback source only while holding the activation lock
+if [[ "$INSTALL_MODE" == rollback-map-flights ]]; then
+    # require a direct root-owned release directory rather than a link or arbitrary tree
+    if [[ ! -d "$ROLLBACK_SOURCE_RELEASE" || -L "$ROLLBACK_SOURCE_RELEASE" || \
+          $(stat -c '%u:%g:%a' "$ROLLBACK_SOURCE_RELEASE") != 0:0:755 ]]; then
+        printf '%s\n' 'map.flights rollback source release is invalid' >&2
+        exit 1
+    fi
+    # refuse a no-op transition to the selected feature release
+    if [[ ! -L /opt/adsb/current || $(readlink -f /opt/adsb/current) == "$ROLLBACK_SOURCE_RELEASE" ]]; then
+        printf '%s\n' 'map.flights rollback requires a different managed current release' >&2
+        exit 1
+    fi
+    # require the exact root-owned application directories consumed by immutable staging
+    for required in adsb_admin web deploy; do
+        if [[ ! -d "$ROLLBACK_SOURCE_RELEASE/$required" || -L "$ROLLBACK_SOURCE_RELEASE/$required" || \
+              -n $(find -P "$ROLLBACK_SOURCE_RELEASE/$required" -xdev \
+                  \( -type l -o ! -user root -o ! -group root -o -perm /022 \) -print -quit) ]]; then
+            printf '%s\n' 'map.flights rollback source release is incomplete' >&2
+            exit 1
+        fi
+    done
+    # require the release-selected map to remain one separately validated link
+    if [[ ! -L "$ROLLBACK_SOURCE_RELEASE/map-ui" ]]; then
+        printf '%s\n' 'map.flights rollback source release lacks its map binding' >&2
+        exit 1
+    fi
+    SOURCE_DIR=$ROLLBACK_SOURCE_RELEASE
+fi
+
 # reject a stale staged update after recovery while still holding the activation lock
 if [[ "$INSTALL_MODE" == update ]]; then
     UPDATE_BASE=${ADSB_UPDATE_BASE_RELEASE:-}
@@ -67,8 +109,8 @@ if [[ ! -s "$ADMIN_ENV" ]] || ! grep -q '^ADSB_ADMIN_PASSWORD_HASH=' "$ADMIN_ENV
     exit 1
 fi
 
-# reject an automatic update when the installed bootstrap contract is incomplete
-if [[ "$INSTALL_MODE" == update ]]; then
+# reject a managed transition when the installed bootstrap contract is incomplete
+if [[ "$INSTALL_MODE" == update || "$INSTALL_MODE" == rollback-map-flights ]]; then
     REQUIRED_UPDATE_COMMANDS=(docker flock install python3 systemctl systemd-analyze tar)
     # require every command used by immutable staging and activation
     for command in "${REQUIRED_UPDATE_COMMANDS[@]}"; do
@@ -265,7 +307,20 @@ find "$APP_RELEASE" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 find "$APP_RELEASE" -type d -name __pycache__ -empty -delete
 chown -R root:root "$APP_RELEASE"
 chmod -R go-w "$APP_RELEASE"
-python3 "$APP_RELEASE/deploy/prepare-map-ui.py" "$MAP_RELEASE"
+# reuse the selected immutable map without downloading a new source during downgrade
+if [[ "$INSTALL_MODE" == rollback-map-flights ]]; then
+    rollback_map=$(readlink -f "$SOURCE_DIR/map-ui")
+    # require one managed immutable map directory owned by root
+    if [[ "$rollback_map" != /opt/adsb/map-ui-releases/* || ! -d "$rollback_map" || -L "$rollback_map" || \
+          $(stat -c '%u:%g:%a' "$rollback_map") != 0:0:755 ]]; then
+        printf '%s\n' 'map.flights rollback map release is invalid' >&2
+        exit 1
+    fi
+    install -d -o root -g root -m 755 "$MAP_RELEASE"
+    cp -a --reflink=auto "$rollback_map/." "$MAP_RELEASE/"
+else
+    python3 "$APP_RELEASE/deploy/prepare-map-ui.py" "$MAP_RELEASE"
+fi
 ln -s "$MAP_RELEASE" "$APP_RELEASE/map-ui"
 
 # validate the private environment without printing secret values
@@ -306,7 +361,7 @@ bash -n "$APP_RELEASE/deploy/alerts/run-source.sh" "$APP_RELEASE/deploy/alerts/s
     printf '%s\n' 'alert source scripts must be executable' >&2
     exit 1
 }
-python3 -B - "$APP_RELEASE" <<'PY'
+python3 -B - "$APP_RELEASE" "$INSTALL_MODE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -327,8 +382,8 @@ images = json.loads((release / "deploy/images.json").read_text(encoding="utf-8")
 catalog = json.loads((release / "deploy/alerts/catalog-manifest.json").read_text(encoding="utf-8"))
 validate_source_proof(proof, images, (release / "deploy/alerts/source-health.sh").read_bytes(), catalog["entry_count"])
 captured = datetime.strptime(proof["production_headroom"]["captured_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-# require a fresh capacity observation for this activation, not steady reconciliation
-if not 0 <= (datetime.now(timezone.utc) - captured).total_seconds() <= 86400:
+# require fresh capacity for new code while retaining already-reviewed rollback evidence
+if sys.argv[2] != "rollback-map-flights" and not 0 <= (datetime.now(timezone.utc) - captured).total_seconds() <= 86400:
     raise SystemExit("alert source headroom proof is stale")
 PY
 
@@ -356,15 +411,19 @@ chown adsb:adsb /var/lib/adsb/config/alerts.json
 chmod 600 /var/lib/adsb/config/alerts.json
 
 # verify image availability before any live file or pointer changes
-python3 - "$APP_RELEASE" <<'PY'
+python3 - "$APP_RELEASE" "$INSTALL_MODE" <<'PY'
 import json
 import subprocess
 import sys
 from pathlib import Path
 
-# pull every immutable image named by the staged release
+# require cached rollback images and pull only ordinary install candidates
 for image in json.loads((Path(sys.argv[1]) / "deploy/images.json").read_text()).values():
-    subprocess.run(["docker", "pull", "--platform", "linux/amd64", image], check=True)
+    # emergency downgrade never allocates unapproved persistent image storage
+    if sys.argv[2] == "rollback-map-flights":
+        subprocess.run(["docker", "image", "inspect", image], check=True, stdout=subprocess.DEVNULL)
+    else:
+        subprocess.run(["docker", "pull", "--platform", "linux/amd64", image], check=True)
 PY
 
 # stage and validate every host integration artifact on its destination filesystem
@@ -465,6 +524,22 @@ sync -f "$ROLLBACK_DIR"
 ACTIVATION_STARTED=true
 write_activation_journal "" "$ROLLBACK_DIR" "$CURRENT_CODE" "$PREVIOUS_MAP" "$LEGACY_LAYOUT" \
     "$APP_RELEASE" "$MAP_RELEASE" "$ACTIVATION_ID" "${JOURNAL_UNIT_STATES[@]}"
+
+# serialize the settings downgrade with the compatible release transition
+if [[ "$INSTALL_MODE" == rollback-map-flights ]]; then
+    # stop the sole settings writer, reconciler and release-bound worker before reading latest state
+    systemctl stop adsb-admin.service adsb-controller.service adsb-alerts.service
+    # stop the shared direct uploader while its removed map.flights connector remains configured
+    if [[ -e /var/lib/adsb/runtime/compose.json || -L /var/lib/adsb/runtime/compose.json ]]; then
+        # refuse to trust a substituted runtime specification while quiescing egress
+        if [[ ! -f /var/lib/adsb/runtime/compose.json || -L /var/lib/adsb/runtime/compose.json ]]; then
+            printf '%s\n' 'ADS-B runtime specification is invalid' >&2
+            exit 1
+        fi
+        docker compose -p adsb -f /var/lib/adsb/runtime/compose.json stop --time 5 ultrafeeder
+    fi
+    project_mapflights_settings "" "$LIVE_SOURCE_DIR" "$APP_RELEASE"
+fi
 
 # activate the prepared release and host files under rollback protection
 # install boot recovery before selecting the new application pointer

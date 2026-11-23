@@ -28,6 +28,8 @@ from adsb_admin.controller import (
     validate_source_proof,
 )
 
+MAPFLIGHTS_UUID = "22222222-2222-4222-8222-222222222222"
+
 
 # exercise configuration generation without Docker or external feed traffic
 class ControllerTests(unittest.TestCase):
@@ -182,6 +184,135 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("piaware", compose["services"])
         self.assertIn("in.adsb.lol", connectors)
         self.assertIn("feed.airplanes.live", connectors)
+
+    # keep old settings readable without mutating or enabling the missing provider
+    def test_mapflights_legacy_settings_are_sparse(self):
+        before = copy.deepcopy(self.settings)
+        normalized = validate_settings(self.settings)
+        self.assertEqual(self.settings, before)
+        self.assertEqual(normalized["networks"]["mapflights"], {"enabled": False, "mlat": False, "feeder_id": ""})
+
+    # verify the root controller rejects invalid provider identity and dependent toggles
+    def test_mapflights_rejects_invalid_stored_settings(self):
+        cases = [
+            (True, True, ""),
+            (False, True, MAPFLIGHTS_UUID),
+            (True, False, "22222222-2222-7222-8222-222222222222"),
+            (True, False, MAPFLIGHTS_UUID + "\n"),
+            (True, False, "aaaaaaaa-aaaa-4AAA-8aaa-aaaaaaaaaaaa"),
+        ]
+        # check malformed credentials without leaking them from errors
+        for enabled, mlat, identifier in cases:
+            self.settings["networks"]["mapflights"] = {"enabled": enabled, "mlat": mlat, "feeder_id": identifier}
+            with self.subTest(enabled=enabled, mlat=mlat), self.assertRaises(ValueError):
+                validate_settings(self.settings)
+
+    # scope the change to exactly one raw connector and a fixed physical 1090 MLAT path
+    def test_mapflights_preserves_other_connectors_and_gates_mlat(self):
+        self.settings["networks"]["adsbexchange"].update(enabled=True, mlat=True)
+        raw = f"adsb,feed.map.flights,30004,beast_reduce_plus_out,uuid={MAPFLIGHTS_UUID}"
+        mlat = f"mlat,mlat.map.flights,31090,uuid={MAPFLIGHTS_UUID},input_connect=airspy:30005"
+        # exercise every receiver combination and both MLAT selections
+        for airspy, uat in ((False, False), (True, False), (False, True), (True, True)):
+            hardware = {**self.present, "airspy": airspy, "uat": uat}
+            baseline = compose_for(self.settings, self.runtime, hardware)
+            # compare each private settings variant to a complete prior rendering
+            for use_mlat in (False, True):
+                requested = copy.deepcopy(self.settings)
+                requested["networks"]["mapflights"] = {"enabled": True, "mlat": use_mlat, "feeder_id": MAPFLIGHTS_UUID}
+                actual = compose_for(requested, self.runtime, hardware, mapflights_attested=True)
+                env = actual["services"]["ultrafeeder"]["environment"]
+                prior = baseline["services"]["ultrafeeder"]["environment"]["ULTRAFEEDER_CONFIG"]
+                expected = [
+                    part
+                    for part in (prior, raw if (airspy or uat) else "", mlat if (airspy and use_mlat) else "")
+                    if part
+                ]
+                with self.subTest(airspy=airspy, uat=uat, mlat=use_mlat):
+                    self.assertEqual(env["ULTRAFEEDER_CONFIG"], ";".join(expected))
+                    env["ULTRAFEEDER_CONFIG"] = prior
+                    self.assertEqual(actual, baseline)
+
+    # keep local connection and hardware evidence distinct from provider verification
+    def test_mapflights_status_has_no_uuid_or_provider_claim(self):
+        self.settings["networks"]["mapflights"] = {"enabled": True, "mlat": True, "feeder_id": MAPFLIGHTS_UUID}
+        uat_only = {**self.present, "airspy": False}
+        metrics = 'readsb_net_connector_status{host="feed.map.flights",port="30004"} 3'
+        status = status_for(self.settings, uat_only, {"ultrafeeder"}, metrics, 0, mapflights_attested=True)["networks"][
+            "mapflights"
+        ]
+        self.assertTrue(status["connected"])
+        self.assertIn("not independently verified", status["message"])
+        self.assertIn("MLAT is waiting for the 1090 MHz receiver", status["message"])
+        self.assertNotIn(MAPFLIGHTS_UUID, json.dumps(status))
+        stopped = status_for(self.settings, self.present, set(), None, 0, mapflights_attested=True)["networks"][
+            "mapflights"
+        ]
+        self.assertFalse(stopped["running"])
+        self.assertEqual(stopped["message"], "Uploader is not running.")
+
+    # pause and resume only map.flights as the controller observes readiness
+    def test_mapflights_reconciliation_is_fenced_by_backup_readiness(self):
+        self.settings["networks"]["adsbexchange"].update(enabled=True, mlat=True)
+        self.settings["networks"]["flightaware"].update(enabled=True)
+        baseline = compose_for(self.settings, self.runtime, self.present)
+        self.settings["networks"]["mapflights"] = {"enabled": True, "mlat": True, "feeder_id": MAPFLIGHTS_UUID}
+        snapshots = []
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as patches:
+            root = Path(directory)
+            runtime = dict(self.runtime, data_dir=str(root))
+            # poll three times with readiness absent attested and then removed
+            patches.enter_context(mock.patch("sys.argv", ["controller"]))
+            patches.enter_context(mock.patch("adsb_admin.controller.load_runtime", return_value=runtime))
+            patches.enter_context(mock.patch("adsb_admin.controller.read_settings", return_value=self.settings))
+            patches.enter_context(mock.patch("adsb_admin.controller.detect_hardware", return_value=self.present))
+            readiness = patches.enter_context(
+                mock.patch("adsb_admin.controller.mapflights_ready", side_effect=[False, True, False])
+            )
+            apply = patches.enter_context(mock.patch("adsb_admin.controller.subprocess.run"))
+            stop = patches.enter_context(mock.patch("adsb_admin.controller.stop_uploaders"))
+            patches.enter_context(mock.patch("adsb_admin.controller.alert_status_for", return_value={}))
+            patches.enter_context(mock.patch("adsb_admin.controller.ReceptionMonitor.collect", return_value={}))
+            patches.enter_context(mock.patch("adsb_admin.controller.connector_metrics", return_value=None))
+            names = set(baseline["services"])
+            patches.enter_context(
+                mock.patch(
+                    "adsb_admin.controller.service_states",
+                    return_value={"running": names, "ready": names, "starting": set()},
+                )
+            )
+
+            # record the rendered output and stop after the third poll
+            def observe(_interval):
+                spec = json.loads((root / "runtime/compose.json").read_text())
+                config = spec["services"]["ultrafeeder"]["environment"]["ULTRAFEEDER_CONFIG"]
+                status = json.loads((root / "status/status.json").read_text())
+                snapshots.append((config, status))
+                # exit only after observing revocation in the same controller process
+                if len(snapshots) == 3:
+                    raise StopIteration
+
+            patches.enter_context(mock.patch("adsb_admin.controller.time.sleep", side_effect=observe))
+            with self.assertRaises(StopIteration):
+                main()
+        self.assertEqual(readiness.call_count, 3)
+        self.assertEqual(apply.call_count, 3)
+        stop.assert_not_called()
+        before = baseline["services"]["ultrafeeder"]["environment"]["ULTRAFEEDER_CONFIG"]
+        self.assertEqual(snapshots[0][0], before)
+        self.assertIn("adsb,feed.map.flights", snapshots[1][0])
+        self.assertIn("mlat,mlat.map.flights", snapshots[1][0])
+        self.assertEqual(snapshots[2][0], before)
+        # show a held request without hiding the running legacy providers
+        for index in (0, 2):
+            status = snapshots[index][1]
+            self.assertEqual(status["applied_revision"], self.settings["revision"])
+            self.assertTrue(status["networks"]["mapflights"]["enabled"])
+            self.assertFalse(status["networks"]["mapflights"]["running"])
+            self.assertIn("backup verifier", status["networks"]["mapflights"]["message"])
+            self.assertTrue(status["networks"]["adsbexchange"]["running"])
+            self.assertTrue(status["networks"]["flightaware"]["running"])
+        self.assertEqual(self.settings["networks"]["mapflights"]["feeder_id"], MAPFLIGHTS_UUID)
 
     # never expose decoder ports or the privileged Docker socket to the web app
     def test_ports_are_loopback_and_no_docker_socket(self):

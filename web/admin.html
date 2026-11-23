@@ -8,7 +8,7 @@
     <title>Ballydídean Farm Sanctuary ADS-B</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=goose-photo-trace">
     <link rel="stylesheet" href="/styles.css">
-    <script src="/admin.js" defer></script>
+    <script src="/admin.js?v=mapflights-1" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -610,6 +610,44 @@
                     <small id="airplaneslive-feeder-hint">No feeder ID is configured</small>
                     <small>A generated UUID is local only; it does not register a network account.</small>
                     <button class="text-button clear-feeder" id="airplaneslive-clear" type="button" hidden>Clear saved feeder ID</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="network-card panel" data-network="mapflights">
+                <div class="network-card-header">
+                  <div>
+                    <h3>map.flights</h3>
+                    <a href="https://map.flights/stations/build" target="_blank" rel="noopener noreferrer">Create or configure a station <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <label class="switch-control">
+                    <span class="switch-label">Feed enabled</span>
+                    <input id="mapflights-enabled" type="checkbox" role="switch">
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="network-state-row">
+                  <span class="state-chip state-off" id="mapflights-requested">Requested: off</span>
+                  <span class="runtime-state" id="mapflights-runtime">Controller status unavailable</span>
+                </div>
+                <div class="network-options">
+                  <label class="switch-control switch-control-compact">
+                    <span class="switch-label">MLAT</span>
+                    <input id="mapflights-mlat" type="checkbox" role="switch" disabled>
+                    <span class="switch-track" aria-hidden="true"></span>
+                  </label>
+                  <div class="field feeder-field">
+                    <label for="mapflights-feeder-id">Station UUID</label>
+                    <div class="feeder-input-row">
+                      <input id="mapflights-feeder-id" type="text" autocomplete="off" spellcheck="false" placeholder="Enter the UUID from map.flights" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" aria-describedby="mapflights-feeder-hint mapflights-feeder-help mapflights-feeder-id-error">
+                    </div>
+                    <small id="mapflights-feeder-hint">No station UUID is configured</small>
+                    <small id="mapflights-feeder-help">Use the provider-issued UUID for the combined 1090/978 feed and MLAT. map.flights reports the combined feed, not 978 MHz separately.</small>
+                    <small class="input-error" id="mapflights-feeder-id-error" hidden></small>
+                    <div class="inline-links">
+                      <a href="https://map.flights/myfeed" target="_blank" rel="noopener noreferrer">Check provider receipt <span aria-hidden="true">↗</span></a>
+                    </div>
+                    <button class="text-button clear-feeder" id="mapflights-clear" type="button" hidden>Clear saved station UUID</button>
                   </div>
                 </div>
               </article>

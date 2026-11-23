@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 HELPER = ROOT / "deploy/release-transaction.sh"
+ROLLBACK = ROOT / "deploy/rollback-map-flights.sh"
 
 HOST_ARTIFACTS = (
     "etc/adsb/admin.env",
@@ -192,6 +194,170 @@ recover_activation {shlex.quote(str(root))}
             self.assertIn("retaining rollback artifacts", result.stderr)
 
 
+class MapFlightsRollbackTests(unittest.TestCase):
+    # build one complete private settings document with a configured optional feed
+    def _settings(self) -> dict:
+        return {
+            "revision": 17,
+            "station": {
+                "name": "Ballydidean Farm",
+                "latitude": 48.1,
+                "longitude": -122.6,
+                "altitude_m": 42,
+            },
+            "networks": {
+                "adsbexchange": {"enabled": True, "mlat": True, "feeder_id": "11111111-1111-4111-8111-111111111111"},
+                "flightaware": {"enabled": True, "mlat": True, "feeder_id": ""},
+                "adsblol": {"enabled": False, "mlat": False, "feeder_id": "22222222-2222-4222-8222-222222222222"},
+                "airplaneslive": {"enabled": True, "mlat": False, "feeder_id": ""},
+                "mapflights": {"enabled": True, "mlat": True, "feeder_id": "33333333-3333-4333-8333-333333333333"},
+            },
+        }
+
+    # remove only map.flights while retaining the latest unrelated settings and revision
+    def test_projection_is_atomic_sparse_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "var/lib/adsb/config/settings.json"
+            settings.parent.mkdir(parents=True)
+            value = self._settings()
+            settings.write_text(json.dumps(value), encoding="utf-8")
+            settings.chmod(0o600)
+            command = (
+                f"source {shlex.quote(str(HELPER))}; "
+                f"project_mapflights_settings {shlex.quote(str(root))} {shlex.quote(str(ROOT))} {shlex.quote(str(ROOT))}"
+            )
+            first = subprocess.run(["bash", "-ec", command], capture_output=True, text=True)
+            self.assertEqual(0, first.returncode, first.stderr)
+            projected = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(value["revision"], projected["revision"])
+            self.assertEqual(value["station"], projected["station"])
+            self.assertEqual(
+                {name: provider for name, provider in value["networks"].items() if name != "mapflights"},
+                projected["networks"],
+            )
+            self.assertEqual(0o600, stat.S_IMODE(settings.stat().st_mode))
+            self.assertNotIn("33333333", first.stdout + first.stderr)
+            first_bytes = settings.read_bytes()
+            second = subprocess.run(["bash", "-ec", command], capture_output=True, text=True)
+            self.assertEqual(0, second.returncode, second.stderr)
+            self.assertEqual(first_bytes, settings.read_bytes())
+            self.assertEqual([], list(settings.parent.glob("*.mapflights-rollback")))
+
+    # reject an invalid identity before replacing or disclosing the private document
+    def test_projection_rejects_invalid_map_identity_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "var/lib/adsb/config/settings.json"
+            settings.parent.mkdir(parents=True)
+            value = self._settings()
+            value["networks"]["mapflights"]["feeder_id"] = "not-a-provider-id"
+            original = json.dumps(value).encode()
+            settings.write_bytes(original)
+            settings.chmod(0o600)
+            command = (
+                f"source {shlex.quote(str(HELPER))}; "
+                f"project_mapflights_settings {shlex.quote(str(root))} {shlex.quote(str(ROOT))} {shlex.quote(str(ROOT))}"
+            )
+            result = subprocess.run(["bash", "-ec", command], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(original, settings.read_bytes())
+            self.assertNotIn("not-a-provider-id", result.stdout + result.stderr)
+
+    # retain the current file when either release reader rejects the projected bytes
+    def test_projection_requires_both_release_readers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "var/lib/adsb/config/settings.json"
+            settings.parent.mkdir(parents=True)
+            value = self._settings()
+            original = json.dumps(value).encode()
+            settings.write_bytes(original)
+            settings.chmod(0o600)
+            rejecting = root / "rejecting-release/adsb_admin"
+            rejecting.mkdir(parents=True)
+            (rejecting / "__init__.py").write_text("", encoding="utf-8")
+            (rejecting / "config.py").write_text(
+                "class SettingsStore:\n    def __init__(self, path):\n        raise RuntimeError('reject')\n",
+                encoding="utf-8",
+            )
+            (rejecting / "controller.py").write_text("def read_settings(path):\n    return {}\n", encoding="utf-8")
+            command = (
+                f"source {shlex.quote(str(HELPER))}; "
+                f"project_mapflights_settings {shlex.quote(str(root))} {shlex.quote(str(ROOT))} "
+                f"{shlex.quote(str(rejecting.parent))}"
+            )
+            result = subprocess.run(["bash", "-ec", command], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(original, settings.read_bytes())
+            self.assertNotIn("33333333", result.stdout + result.stderr)
+
+    # recover the current release after a post-projection crash without restoring stale settings
+    def test_activation_recovery_keeps_projected_latest_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "opt/adsb/releases/current"
+            candidate = root / "opt/adsb/releases/legacy-copy"
+            old_map = root / "opt/adsb/map-ui-releases/current"
+            candidate_map = root / "opt/adsb/map-ui-releases/legacy-copy"
+            rollback = root / "var/lib/adsb/runtime/activation-legacy-copy"
+            # create one complete managed activation root
+            for path in (current, candidate, old_map, candidate_map, rollback):
+                path.mkdir(parents=True)
+            rollback.chmod(0o700)
+            for index, relative in enumerate(HOST_ARTIFACTS):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"current-{index}", encoding="utf-8")
+            (root / "opt/adsb/current").symlink_to(current)
+            (root / "opt/adsb/map-ui").symlink_to(old_map)
+            settings = root / "var/lib/adsb/config/settings.json"
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(json.dumps(self._settings()), encoding="utf-8")
+            settings.chmod(0o600)
+            states = "false false " * 8
+            script = f"""
+set -euo pipefail
+source {shlex.quote(str(HELPER))}
+backup_activation_files {shlex.quote(str(root))} {shlex.quote(str(rollback))}
+write_activation_journal {shlex.quote(str(root))} {shlex.quote(str(rollback))} \
+    {shlex.quote(str(current))} {shlex.quote(str(old_map))} false \
+    {shlex.quote(str(candidate))} {shlex.quote(str(candidate_map))} {"a" * 32} {states}
+project_mapflights_settings {shlex.quote(str(root))} {shlex.quote(str(ROOT))} {shlex.quote(str(ROOT))}
+ln -sfn {shlex.quote(str(candidate))} {shlex.quote(str(root / "opt/adsb/current"))}
+systemctl() {{ return 0; }}
+recover_activation {shlex.quote(str(root))}
+"""
+            subprocess.run(["bash", "-ec", script], check=True)
+            self.assertEqual(current, (root / "opt/adsb/current").resolve())
+            projected = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertNotIn("mapflights", projected["networks"])
+            self.assertEqual(17, projected["revision"])
+            self.assertFalse(candidate.exists())
+
+    # bind the public rollback command to the one lock-owning installer transaction
+    def test_command_and_installer_order_are_fixed(self):
+        wrapper = ROLLBACK.read_text(encoding="utf-8")
+        installer = (ROOT / "deploy/install.sh").read_text(encoding="utf-8")
+        self.assertIn('exec "$SCRIPT_DIR/install.sh" --rollback-map-flights "$1"', wrapper)
+        self.assertNotIn("prepare_activation_lock", wrapper)
+        lock = installer.index("prepare_activation_lock")
+        journal = installer.index('write_activation_journal ""')
+        stop_writer = installer.index("systemctl stop adsb-admin.service", journal)
+        project = installer.index('project_mapflights_settings ""', stop_writer)
+        pointer = installer.index('mv -Tf "/opt/adsb/current.$$.next" /opt/adsb/current', project)
+        self.assertLess(lock, journal)
+        self.assertLess(journal, stop_writer)
+        self.assertLess(stop_writer, project)
+        self.assertLess(project, pointer)
+        self.assertIn(
+            "docker compose -p adsb -f /var/lib/adsb/runtime/compose.json stop --time 5 ultrafeeder", installer
+        )
+        self.assertIn('["docker", "image", "inspect", image]', installer)
+        self.assertIn('sys.argv[2] != "rollback-map-flights"', installer)
+        self.assertIn('find -P "$ROLLBACK_SOURCE_RELEASE/$required" -xdev', installer)
+
+
 class UpdaterInstallerContractTests(unittest.TestCase):
     # require failure-propagating gates before the first pointer change
     def test_startup_guards_cover_apps_docker_and_backup(self):
@@ -301,7 +467,7 @@ status=$?
     def test_updater_units_have_fixed_triggers_and_command(self):
         service = (ROOT / "deploy/adsb-updater.service").read_text(encoding="utf-8")
         path = (ROOT / "deploy/adsb-updater.path").read_text(encoding="utf-8")
-        self.assertIn("ExecStart=/usr/bin/python3 -I /opt/adsb/current/adsb_admin/update_worker.py", service)
+        self.assertIn("ExecStart=/usr/bin/python3 -I -B /opt/adsb/current/adsb_admin/update_worker.py", service)
         self.assertIn("ProtectSystem=strict", service)
         self.assertIn("MemoryMax=256M", service)
         self.assertIn("PathChanged=/var/lib/adsb/status/maintenance.json", path)

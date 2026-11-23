@@ -3,7 +3,11 @@
 import io
 import json
 import os
+import shlex
+import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -78,6 +82,23 @@ class UpdateWorkerTests(unittest.TestCase):
     def test_service_unit_verification_has_private_tmp(self):
         unit = (Path(__file__).parents[1] / "deploy/adsb-updater.service").read_text()
         self.assertIn("PrivateTmp=true", unit.splitlines())
+
+    # import through the unit flags without polluting the selected release
+    def test_service_does_not_write_bytecode_into_its_release(self):
+        repo = Path(__file__).parents[1]
+        unit = (repo / "deploy/adsb-updater.service").read_text()
+        command = shlex.split(
+            next(line.removeprefix("ExecStart=") for line in unit.splitlines() if line.startswith("ExecStart="))
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "adsb_admin"
+            shutil.copytree(repo / "adsb_admin", package, ignore=shutil.ignore_patterns("__pycache__"))
+            subprocess.run(
+                [sys.executable, *command[1:-1], str(package / Path(command[-1]).name), "--help"],
+                check=True,
+                capture_output=True,
+            )
+            self.assertFalse(list(package.rglob("__pycache__")))
 
     # keep docker proof bind sources visible to the daemon outside private tmp
     def test_update_commands_use_host_visible_private_scratch(self):

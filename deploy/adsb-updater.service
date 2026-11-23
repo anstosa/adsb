@@ -11,7 +11,8 @@ WorkingDirectory=/opt/adsb/current
 Environment=DOCKER_CONFIG=/run/adsb-updater/docker
 RuntimeDirectory=adsb-updater
 RuntimeDirectoryMode=0700
-ExecStart=/usr/bin/python3 -I /opt/adsb/current/adsb_admin/update_worker.py
+# keep bytecode out of the immutable release and backup archive
+ExecStart=/usr/bin/python3 -I -B /opt/adsb/current/adsb_admin/update_worker.py
 TimeoutStartSec=45min
 Nice=10
 IOSchedulingClass=idle

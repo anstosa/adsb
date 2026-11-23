@@ -1,0 +1,123 @@
+--- a/src/adapters/adsb.mjs
++++ b/src/adapters/adsb.mjs
+@@ -17,4 +17,5 @@
+ const STATION_NAME = /^[A-Za-z0-9 ._-]{1,64}$/
+ const NETWORK_NAMES = Object.freeze(['adsbexchange', 'flightaware', 'adsblol', 'airplaneslive'])
++const NETWORK_NAMES_V2 = Object.freeze([...NETWORK_NAMES, 'mapflights'])
+ const IMAGE_NAMES = Object.freeze(['ultrafeeder', 'piaware', 'airspy', 'dump978', 'proxy', 'cloudflared'])
+ const ALERT_CATEGORIES = Object.freeze(['military', 'medical', 'news'])
+@@ -24,4 +25,5 @@
+ const HOSTNAME = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/
+ const APPLICATION_ROOT = 'opt/adsb/current'
++const SETTINGS_SCHEMA_PATH = `${APPLICATION_ROOT}/deploy/settings-schema.json`
+ const APPLICATION_REQUIRED = Object.freeze([
+   `${APPLICATION_ROOT}/adsb_admin/__init__.py`,
+@@ -356,6 +358,23 @@
+ }
+
++// validate the optional capability of the selected immutable release
++async function supportsMapFlightsSettings(root, entries) {
++  const entry = entries.find((candidate) => candidate.path === SETTINGS_SCHEMA_PATH)
++
++  // retain historical releases without a capability marker
++  if (!entry) return false
++
++  validateReleaseFileEntry(entry, { mode: 0o644, maximumBytes: 1024 })
++  const marker = await readJson(join(root, SETTINGS_SCHEMA_PATH))
++  invariant(
++    hasExactKeys(marker, ['schema_version', 'optional_network']) &&
++    marker.schema_version === 2 && marker.optional_network === 'mapflights',
++    'CONTENT_INVALID', 'ADS-B settings schema marker differs'
++  )
++  return true
++}
++
+ // validate the complete private station settings
+-function validateSettings(settings) {
++function validateSettings(settings, supportsMapFlights) {
+   invariant(hasExactKeys(settings, ['revision', 'station', 'networks']), 'CONTENT_INVALID', 'ADS-B settings schema differs')
+   invariant(Number.isInteger(settings.revision) && settings.revision >= 0, 'CONTENT_INVALID', 'ADS-B settings revision is invalid')
+@@ -365,12 +384,21 @@
+   invariant(validCoordinate(settings.station.longitude, -180, 180), 'CONTENT_INVALID', 'ADS-B station longitude is invalid')
+   invariant(validCoordinate(settings.station.altitude_m, -500, 10000), 'CONTENT_INVALID', 'ADS-B station altitude is invalid')
+-  invariant(hasExactKeys(settings.networks, NETWORK_NAMES), 'CONTENT_INVALID', 'ADS-B network schema differs')
++  const networkNames = supportsMapFlights && hasExactKeys(settings.networks, NETWORK_NAMES_V2)
++    ? NETWORK_NAMES_V2 : NETWORK_NAMES
++  invariant(hasExactKeys(settings.networks, networkNames), 'CONTENT_INVALID', 'ADS-B network schema differs')
+
+   // validate every provider record
+-  for (const name of NETWORK_NAMES) {
++  for (const name of networkNames) {
+     const network = settings.networks[name]
+     invariant(hasExactKeys(network, ['enabled', 'mlat', 'feeder_id']), 'CONTENT_INVALID', 'ADS-B provider schema differs')
+     invariant(typeof network.enabled === 'boolean' && typeof network.mlat === 'boolean', 'CONTENT_INVALID', 'ADS-B provider switch is invalid')
+     invariant(typeof network.feeder_id === 'string' && (network.feeder_id === '' || UUID.test(network.feeder_id)), 'CONTENT_INVALID', 'ADS-B provider identity is invalid')
++
++    // require the exact map.flights identity and base-feed relationship
++    if (name === 'mapflights') {
++      invariant(network.feeder_id === '' || network.feeder_id.length === 36, 'CONTENT_INVALID', 'ADS-B map.flights identity is invalid')
++      invariant(!network.enabled || network.feeder_id !== '', 'CONTENT_INVALID', 'ADS-B map.flights identity is missing')
++      invariant(!network.mlat || network.enabled, 'CONTENT_INVALID', 'ADS-B map.flights MLAT requires the base feed')
++    }
+
+     // require restore-ready station coordinates for active feeds
+@@ -852,5 +880,5 @@
+   const images = await readJson(join(root, `${APPLICATION_ROOT}/deploy/images.json`))
+   validateRuntime(runtime, images)
+-  validateSettings(settings)
++  validateSettings(settings, await supportsMapFlightsSettings(root, entries))
+   await validateTunnel(root, runtime)
+
+--- a/test/unit/adapters.test.mjs
++++ b/test/unit/adapters.test.mjs
+@@ -220,4 +220,50 @@
+ })
+
++// verify private settings only with a compatible selected release
++test('U-ARC-ADSB map.flights settings require the exact immutable schema marker', async () => {
++  const root = await createTestRoot()
++
++  try {
++    const fixture = await createAdsbFixtureConfig(root)
++    const path = 'opt/adsb/current/deploy/settings-schema.json'
++    const marker = JSON.stringify({ schema_version: 2, optional_network: 'mapflights' })
++    const legacy = {
++      revision: 17,
++      station: { name: 'Fixture station', latitude: 47, longitude: -122, altitude_m: 30 },
++      networks: Object.fromEntries(['adsbexchange', 'flightaware', 'adsblol', 'airplaneslive']
++        .map((key) => [key, { enabled: false, mlat: false, feeder_id: '' }]))
++    }
++    const mapflights = { enabled: true, mlat: true, feeder_id: '22222222-2222-4222-8222-222222222222' }
++    const withMapFlights = (network) => ({ ...legacy, networks: { ...legacy.networks, mapflights: network } })
++    const configured = withMapFlights(mapflights)
++    const markerFile = [[path, marker, 0o644]]
++
++    // accept legacy archives and attributed current archives
++    for (const [name, settings, extraFiles] of [
++      ['legacy', legacy, []],
++      ['sparse', legacy, markerFile],
++      ['configured', configured, markerFile]
++    ]) {
++      assert.equal((await verifyAdsbVariant(root, fixture, `mapflights-${name}`, { settings, extraFiles })).archiveVerified, true)
++    }
++
++    // fail closed on incompatible release metadata, shape or configuration
++    for (const [name, settings, extraFiles] of [
++      ['missing', configured, []],
++      ['wrong-mode', configured, [[path, marker, 0o755]]],
++      ['oversize', configured, [[path, marker + ' '.repeat(1024), 0o644]]],
++      ['extra-key', configured, [[path, '{"schema_version":2,"optional_network":"mapflights","extra":true}', 0o644]]],
++      ['wrong-release', configured, [['opt/adsb/current/deploy/other-schema.json', marker, 0o644]]],
++      ['legacy-invalid-marker', legacy, [[path, '{}', 0o644]]],
++      ['invalid-id', withMapFlights({ ...mapflights, feeder_id: mapflights.feeder_id + '\n' }), markerFile],
++      ['orphan-mlat', withMapFlights({ ...mapflights, enabled: false }), markerFile]
++    ]) {
++      await assert.rejects(verifyAdsbVariant(root, fixture, `mapflights-${name}`, { settings, extraFiles }), { code: 'CONTENT_INVALID' })
++    }
++  } finally {
++    await removeTestRoot(root)
++  }
++})
++
+ test('U-ARC-ADSB-02 ADS-B archives reject paths outside the restore allowlist', async () => {
+   const root = await createTestRoot()

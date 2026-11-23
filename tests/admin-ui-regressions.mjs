@@ -17,7 +17,7 @@ const { chromium } = require(playwrightModule);
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB_ROOT = path.join(PROJECT_ROOT, "web");
 const TEST_TIMEOUT_MS = 7000;
-const NETWORK_IDS = ["adsbexchange", "flightaware", "adsblol", "airplaneslive"];
+const NETWORK_IDS = ["adsbexchange", "flightaware", "adsblol", "airplaneslive", "mapflights"];
 const REPORT_GENERATION = "a".repeat(64);
 const AVAILABLE_CANDIDATE_ID = "b".repeat(64);
 const HELD_CANDIDATE_ID = "c".repeat(64);
@@ -321,6 +321,12 @@ class FakeAdminServer {
     const requestUrl = new URL(request.url, this.origin || "http://127.0.0.1");
     const pathname = requestUrl.pathname;
     this.requests.push(`${request.method} ${pathname}`);
+    // retain an incompatible cached script at the previous rollout url
+    if (this.legacyAdminScript && pathname === "/admin.js" && !requestUrl.search) {
+      response.writeHead(200, { "Content-Type": "application/javascript", "Cache-Control": "public, max-age=300" });
+      response.end("window.legacyAdminScript = true;");
+      return;
+    }
     // expose one authenticated local browser session
     if (request.method === "GET" && pathname === "/api/session") {
       sendJson(response, 200, this.sessionAuthenticated
@@ -449,6 +455,10 @@ async function openPage(browser, server, viewport = { width: 1280, height: 900 }
       consoleErrors.push(message.text());
     }
   });
+  // prime the old asset identity before testing a release transition
+  if (server.legacyAdminScript) {
+    await page.goto(`${server.origin}/admin.js`, { waitUntil: "load" });
+  }
   await page.goto(`${server.origin}/admin`, { waitUntil: "load" });
   return { page, pageErrors, consoleErrors };
 }
@@ -1119,6 +1129,85 @@ async function testStaleStationSaveSuccessRestoresControl(browser) {
 // verify an old rejected station save leaves replacement controls usable
 async function testStaleStationSaveRejectionRestoresControl(browser) {
   await exerciseStaleStationSave(browser, 409, { error: "revision_conflict" });
+}
+
+// verify the map.flights identity, dependency and redaction-aware save controls
+async function testMapFlightsFeedControls(browser) {
+  const server = new FakeAdminServer();
+  server.legacyAdminScript = true;
+  await server.start();
+  const { page, pageErrors, consoleErrors } = await openPage(browser, server);
+  try {
+    assert.equal(await page.evaluate(() => window.legacyAdminScript), undefined);
+    await page.locator("#revision-label").getByText("Revision 1", { exact: true }).waitFor();
+    assert.equal(await page.locator('[data-network="mapflights"]').count(), 1);
+    assert.equal(await page.locator("#mapflights-generate").count(), 0);
+    assert.equal(await page.locator("#mapflights-mlat").isDisabled(), true);
+    assert.match(await page.locator("#mapflights-feeder-help").textContent(), /combined 1090\/978 feed/i);
+    await page.locator('[data-network="mapflights"]').getByText("Feed enabled", { exact: true }).click();
+    assert.equal(await page.locator("#mapflights-mlat").isDisabled(), false);
+    const missingUuidError = await page.evaluate(() => {
+      // capture only the client-side validation outcome
+      try {
+        window.collectConfig();
+        return "";
+      } catch (error) {
+        return error.message;
+      }
+    });
+    assert.match(missingUuidError, /provider-issued.*station UUID/i);
+    await page.locator("#station-latitude").fill("48.2");
+    await page.locator("#station-longitude").fill("-122.6");
+    await page.locator("#station-altitude").fill("40");
+    await page.locator("#mapflights-feeder-id").fill("123E4567-E89B-42D3-A456-426614174000");
+    await page.locator('[data-network="mapflights"]').getByText("MLAT", { exact: true }).click();
+    const saveRequest = page.waitForRequest((request) =>
+      request.method() === "PUT" && new URL(request.url()).pathname === "/api/admin/config");
+    await page.locator("#save-button").click();
+    const payload = (await saveRequest).postDataJSON();
+    assert.deepEqual(Object.keys(payload.networks).sort(), [...NETWORK_IDS].sort());
+    assert.deepEqual(payload.networks.mapflights, {
+      enabled: true,
+      mlat: true,
+      feeder_id: "123e4567-e89b-42d3-a456-426614174000"
+    });
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+  } finally {
+    await closeScenario(page, server);
+  }
+}
+
+// verify a saved map.flights identity cannot be cleared while its feed stays enabled
+async function testMapFlightsSavedIdentityControls(browser) {
+  const server = new FakeAdminServer();
+  await server.start();
+  const { page, pageErrors, consoleErrors } = await openPage(browser, server);
+  try {
+    await page.locator("#revision-label").getByText("Revision 1", { exact: true }).waitFor();
+    const configured = stationConfig();
+    configured.networks.mapflights = { enabled: true, mlat: true, feeder_id_configured: true };
+    await page.evaluate((config) => window.renderConfig(config), configured);
+    assert.match(await page.locator("#mapflights-feeder-hint").textContent(), /Saved station UUID: ••••••••/);
+    await page.locator("#mapflights-clear").click();
+    const clearedUuidError = await page.evaluate(() => {
+      // capture only the client-side validation outcome
+      try {
+        window.collectConfig();
+        return "";
+      } catch (error) {
+        return error.message;
+      }
+    });
+    assert.match(clearedUuidError, /provider-issued.*station UUID/i);
+    await page.locator('[data-network="mapflights"]').getByText("Feed enabled", { exact: true }).click();
+    assert.equal(await page.locator("#mapflights-mlat").isChecked(), false);
+    assert.equal(await page.locator("#mapflights-mlat").isDisabled(), true);
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+  } finally {
+    await closeScenario(page, server);
+  }
 }
 
 // verify exact-aircraft and model rules save and reload together
@@ -1852,6 +1941,8 @@ const tests = [
   ["stale logout rejection restores control", testStaleLogoutRejectionRestoresControl],
   ["stale station-save success restores control", testStaleStationSaveSuccessRestoresControl],
   ["stale station-save rejection restores control", testStaleStationSaveRejectionRestoresControl],
+  ["map.flights feed controls require the provider UUID", testMapFlightsFeedControls],
+  ["map.flights saved UUID cannot be cleared while active", testMapFlightsSavedIdentityControls],
   ["model and exact-aircraft overrides save together", testModelOverrideSaveAndReload],
   ["model override validation blocks invalid drafts", testModelOverrideClientValidation],
   ["model override server errors map to their input", testModelOverrideServerValidation],

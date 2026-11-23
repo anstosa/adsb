@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from .auth import password_hash_from_environment
+from .config import mapflights_ready
 from .server import AdminApplication, create_server
 
 
@@ -36,6 +37,7 @@ def main() -> None:
         origin=args.origin,
         secure_cookie=not args.insecure_cookie,
         frame_origin=args.frame_origin,
+        mapflights_ready=mapflights_ready,
     )
     server = create_server((args.bind, args.port), application)
     try:
